@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verificador WhatsApp</title>
+<style>
+:root{--bg:#f4f6f5;--card:#fff;--tx:#111b21;--mut:#667781;--g:#25d366;--r:#e5484d;--bd:#e3e8e6}
+@media(prefers-color-scheme:dark){:root{--bg:#0b141a;--card:#111b21;--tx:#e9edef;--mut:#8696a0;--bd:#222d34}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:32px;width:100%;max-width:560px;text-align:center}
+h1{margin:0 0 8px;font-size:26px}
+p{color:var(--mut);margin:8px 0 20px}
+button,.btn{background:var(--g);color:#06260f;border:0;border-radius:10px;padding:12px 22px;font:600 16px system-ui;cursor:pointer;text-decoration:none;display:inline-block}
+button.sec{background:transparent;color:var(--tx);border:1px solid var(--bd)}
+.hide{display:none!important}
+img.qr{width:260px;height:260px;background:#fff;padding:10px;border-radius:12px}
+.drop{display:block;border:2px dashed var(--bd);border-radius:12px;padding:32px;cursor:pointer;color:var(--mut)}
+.drop.on{border-color:var(--g)}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:20px 0}
+.stat{border:1px solid var(--bd);border-radius:12px;padding:14px;color:var(--mut);font-size:14px}
+.stat b{display:block;font-size:28px;color:var(--tx)}
+.yes b{color:var(--g)}.no b{color:var(--r)}
+.bar{height:10px;background:var(--bd);border-radius:6px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--g);transition:width .3s}
+table{width:100%;border-collapse:collapse;margin-top:16px;font-size:14px;text-align:left}
+td{padding:6px 4px;border-top:1px solid var(--bd)}
+.ok{color:var(--g);font-weight:700}.ko{color:var(--r);font-weight:700}
+.row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:16px}
+.spin{width:36px;height:36px;border:4px solid var(--bd);border-top-color:var(--g);border-radius:50%;animation:s 1s linear infinite;margin:16px auto}
+@keyframes s{to{transform:rotate(360deg)}}
+</style></head><body>
+<div class="card">
+  <section id="s1">
+    <h1>Verificador de WhatsApp</h1>
+    <p>Subí una lista de teléfonos y te devuelvo cuáles tienen WhatsApp.<br>No se envía ningún mensaje.</p>
+    <button id="go">Comenzar</button>
+    <p id="busy" class="hide" style="color:var(--r)">Hay muchos usuarios ahora mismo. Probá de nuevo en unos minutos.</p>
+    <p style="font-size:13px">Vinculás tu WhatsApp a una sesión temporal. Al terminar, cerrá la sesión: se borran tu vínculo y tus datos.</p>
+  </section>
+
+  <section id="s2" class="hide">
+    <h1>Conectá tu WhatsApp</h1>
+    <div id="loading"><div class="spin"></div><p>Buscando sesión…</p></div>
+    <div id="qrbox" class="hide">
+      <p>WhatsApp → Dispositivos vinculados → Vincular un dispositivo</p>
+      <img class="qr" id="qr" alt="QR">
+    </div>
+  </section>
+
+  <section id="s3" class="hide">
+    <h1 style="color:var(--g)">✔ ¡Conexión OK!</h1>
+    <p>Sesión de WhatsApp Web activa.</p>
+    <button id="next">Continuar</button>
+  </section>
+
+  <section id="s4" class="hide">
+    <h1>Importá tu lista</h1>
+    <p>CSV con una columna de teléfonos, con código de país (ej. 5491122334455).</p>
+    <label class="drop" id="drop">Hacé clic o arrastrá el CSV acá<input id="file" type="file" accept=".csv,.txt" hidden></label>
+    <p id="info"></p>
+    <button id="run" class="hide">Verificar</button>
+  </section>
+
+  <section id="s5" class="hide">
+    <h1 id="t5">Verificando…</h1>
+    <div class="bar"><i id="bar"></i></div>
+    <div class="stats">
+      <div class="stat"><b id="done">0</b>de <span id="total">0</span></div>
+      <div class="stat yes"><b id="yes">0</b>con WhatsApp</div>
+      <div class="stat no"><b id="no">0</b>sin WhatsApp</div>
+    </div>
+    <div class="row">
+      <button class="sec" id="stop">Detener</button>
+      <a class="btn hide" id="dl" href="/results.csv">Descargar CSV</a>
+      <button class="sec hide" id="out">Cerrar sesión y borrar datos</button>
+    </div>
+    <table id="tb"></table>
+  </section>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let step = 1, started = false, numbers = [];
+const show = n => { step = n; for (let i = 1; i <= 5; i++) $('s' + i).classList.toggle('hide', i !== n); };
+
+$('go').onclick = async () => {
+  $('go').disabled = true;
+  const r = await fetch('/connect', { method: 'POST' });
+  $('go').disabled = false;
+  if (r.status === 503) { $('busy').classList.remove('hide'); return; }
+  $('busy').classList.add('hide'); show(2); listen();
+};
+$('out').onclick = async () => { await fetch('/logout', { method: 'POST' }); location.reload(); };
+$('next').onclick = () => show(4);
+
+function parse(t) {
+  const L = t.split(/\r?\n/).filter(x => x.trim());
+  if (!L.length) return [];
+  const sp = l => l.split(/[,;\t]/).map(c => c.trim().replace(/^"|"$/g, ''));
+  let col = 0, rows = L;
+  if (!/\d{5,}/.test(L[0])) { // primera fila = encabezado
+    const i = sp(L[0]).findIndex(c => /phone|tel|cel|numero|número|number|whats/i.test(c));
+    col = i >= 0 ? i : 0; rows = L.slice(1);
+  }
+  return rows.map(l => (sp(l)[col] || '').replace(/\D/g, '')).filter(n => n.length >= 8);
+}
+
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  numbers = [...new Set(parse(await f.text()))];
+  $('info').textContent = numbers.length ? numbers.length + ' números válidos detectados' : 'No encontré teléfonos en el archivo';
+  $('run').classList.toggle('hide', !numbers.length);
+};
+$('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('on'); };
+$('drop').ondragleave = () => $('drop').classList.remove('on');
+$('drop').ondrop = e => { e.preventDefault(); $('file').files = e.dataTransfer.files; $('file').onchange({ target: $('file') }); };
+
+$('run').onclick = async () => {
+  started = true; show(5);
+  await fetch('/start', { method: 'POST', body: JSON.stringify({ numbers }) });
+};
+$('stop').onclick = () => fetch('/stop', { method: 'POST' });
+
+function listen() {
+const es = new EventSource('/events');
+es.onmessage = e => {
+  const s = JSON.parse(e.data);
+  if (step === 2) {
+    if (s.state === 'connected') show(3);
+    else if (s.state === 'qr') {
+      $('loading').classList.add('hide'); $('qrbox').classList.remove('hide');
+      $('qr').src = 'data:image/png;base64,' + s.qr;
+    }
+  }
+  if (started) {
+    $('done').textContent = s.done; $('total').textContent = s.total;
+    $('yes').textContent = s.yes; $('no').textContent = s.no;
+    $('bar').style.width = (s.total ? s.done / s.total * 100 : 0) + '%';
+    $('tb').innerHTML = s.last.map(r => `<tr><td>${r.phone}</td><td class="${r.status === 'yes' ? 'ok' : 'ko'}">${r.status}</td></tr>`).join('');
+    if (!s.running && s.done > 0) { $('t5').textContent = 'Listo'; $('dl').classList.remove('hide'); $('stop').classList.add('hide'); $('out').classList.remove('hide'); }
+  }
+};
+}
+
+// Si recarga la página con una sesión viva, retoma donde estaba
+fetch('/state').then(r => r.json()).then(s => {
+  if (!s.exists) return;
+  if (s.running || s.done > 0) { started = true; show(5); }
+  else show(s.state === 'connected' ? 3 : 2);
+  listen();
+});
+</script></body></html>

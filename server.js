@@ -1,0 +1,197 @@
+// Verificador de números en WhatsApp Web, multiusuario.
+// Cada visitante tiene su propio Chromium, su QR y un perfil temporal que se borra al terminar.
+// Solo tipea en "Nuevo chat" y lee lo que aparece. No envía nada.
+const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
+const { chromium } = require('playwright');
+
+const PORT = process.env.PORT || 3000;
+const HEADLESS = process.env.HEADLESS !== '0';
+const MAX_SESSIONS = +process.env.MAX_SESSIONS || 3;      // cada una ~400 MB de RAM
+const MAX_NUMBERS = +process.env.MAX_NUMBERS || 200;      // por corrida
+const IDLE_MS = (+process.env.IDLE_MIN || 10) * 60 * 1000;
+const BASE_DIR = process.env.SESSIONS_DIR || path.join(os.tmpdir(), 'wa-sessions');
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const DELAY_TECLA = 70;
+const ESPERA_RESULTADO = 2200;
+
+// Textos con los que WhatsApp indica que el número no existe / no hay resultados
+const NEG = /not on whatsapp|isn.t on whatsapp|no est[aá] en whatsapp|no results|no se encontr|sin resultados|invalid|inv[aá]lid|not found/i;
+
+const sessions = new Map();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+class Session {
+  constructor(id) {
+    this.id = id; this.dir = path.join(BASE_DIR, id);
+    this.state = 'starting'; this.qr = null; this.running = false; this.stop = false;
+    this.total = 0; this.rows = []; this.clients = new Set(); this.touched = Date.now(); this.closed = false;
+  }
+  touch() { this.touched = Date.now(); }
+  pub() {
+    return {
+      state: this.state, qr: this.qr, running: this.running, total: this.total, done: this.rows.length,
+      yes: this.rows.filter(r => r.status === 'yes').length,
+      no: this.rows.filter(r => r.status === 'no').length,
+      last: this.rows.slice(-12).reverse(),
+    };
+  }
+  push() { const m = `data: ${JSON.stringify(this.pub())}\n\n`; this.clients.forEach(c => c.write(m)); }
+  nuevoChat() { return this.page.getByRole('button', { name: /new chat|nuevo chat/i }).first(); }
+
+  async start() {
+    this.ctx = await chromium.launchPersistentContext(this.dir, {
+      headless: HEADLESS, userAgent: UA, viewport: { width: 1100, height: 760 },
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    this.page = this.ctx.pages()[0] || await this.ctx.newPage();
+    await this.page.goto('https://web.whatsapp.com');
+    while (!this.closed) {
+      try {
+        if (this.running) { await sleep(1500); continue; }
+        if (await this.nuevoChat().isVisible()) {
+          if (this.state !== 'connected') { this.state = 'connected'; this.qr = null; this.push(); }
+        } else {
+          const canvas = this.page.locator('canvas').first();
+          if (await canvas.isVisible()) {
+            this.qr = (await canvas.screenshot()).toString('base64'); this.state = 'qr';
+          } else if (this.state !== 'connected') this.state = 'loading';
+          this.push();
+        }
+      } catch { /* página navegando */ }
+      await sleep(1500);
+    }
+  }
+
+  async check(num) {
+    const { page } = this;
+    await this.nuevoChat().click();
+    const caja = page.locator('[contenteditable="true"][role="textbox"]').first();
+    await caja.waitFor({ timeout: 8000 });
+    await caja.click();
+    await page.keyboard.type(num, { delay: DELAY_TECLA });
+    await sleep(ESPERA_RESULTADO);
+    const texto = await caja.evaluate(el => {
+      let n = el;
+      for (let i = 0; i < 8 && n.parentElement; i++) {
+        n = n.parentElement;
+        if (n.querySelector('[role="listitem"], [role="list"], [role="grid"]')) break;
+      }
+      return n.innerText;
+    });
+    const hayResultado = (await page.locator('[role="listitem"], [role="gridcell"]').count()) > 0;
+    await page.keyboard.press('Control+A');
+    await page.keyboard.press('Backspace');
+    await page.keyboard.press('Escape'); // cierra el panel; nunca Enter, nunca abre un chat
+    const t = texto.replace(/\s*\n\s*/g, ' | ').trim();
+    return { phone: num, status: !NEG.test(t) && hayResultado ? 'yes' : 'no', raw: t };
+  }
+
+  async run(numbers) {
+    this.running = true; this.stop = false; this.rows = []; this.total = numbers.length; this.push();
+    for (const n of numbers) {
+      if (this.stop || this.closed) break;
+      try { this.rows.push(await this.check(n)); }
+      catch (e) {
+        this.rows.push({ phone: n, status: 'no', raw: 'error: ' + e.message.split('\n')[0] });
+        try { await this.page.keyboard.press('Escape'); } catch {}
+      }
+      this.touch(); this.push();
+      await sleep(1200 + Math.random() * 1500);
+    }
+    this.running = false; this.touch(); this.push();
+  }
+
+  csv() { return 'phone,status\n' + this.rows.map(r => `${r.phone},${r.status}`).join('\n'); }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true; this.stop = true;
+    this.clients.forEach(c => c.end()); this.clients.clear();
+    try { await this.ctx?.close(); } catch {}
+    try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch {}
+    sessions.delete(this.id);
+  }
+}
+
+// Limpieza de sesiones inactivas (y de carpetas huérfanas de una corrida anterior)
+fs.rmSync(BASE_DIR, { recursive: true, force: true });
+fs.mkdirSync(BASE_DIR, { recursive: true });
+setInterval(() => {
+  for (const s of sessions.values()) {
+    if (!s.running && Date.now() - s.touched > IDLE_MS) s.close();
+  }
+}, 30000);
+
+const cookieId = req => (/(?:^|;\s*)sid=([a-f0-9]{32})/.exec(req.headers.cookie || '') || [])[1];
+const body = req => new Promise(r => { let b = ''; req.on('data', c => { b += c; if (b.length > 5e6) req.destroy(); }); req.on('end', () => r(b)); });
+
+http.createServer(async (req, res) => {
+  const url = req.url.split('?')[0];
+  let sid = cookieId(req);
+  const s = sid && sessions.get(sid);
+  if (s) s.touch();
+
+  if (url === '/') {
+    if (!sid) {
+      sid = crypto.randomBytes(16).toString('hex');
+      const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+      res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400${secure}`);
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
+  }
+
+  if (url === '/connect' && req.method === 'POST') {
+    if (!sid) { res.writeHead(400); return res.end('sin cookie'); }
+    if (!s) {
+      if (sessions.size >= MAX_SESSIONS) { res.writeHead(503); return res.end('Servidor ocupado'); }
+      const ns = new Session(sid); sessions.set(sid, ns);
+      ns.start().catch(() => ns.close());
+    }
+    res.writeHead(200); return res.end('ok');
+  }
+
+  if (!s) { // el resto requiere sesión viva
+    if (url === '/state') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end('{"exists":false}'); }
+    res.writeHead(404); return res.end('sin sesión');
+  }
+
+  if (url === '/state') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ exists: true, ...s.pub() }));
+  }
+  if (url === '/events') {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+    s.clients.add(res);
+    res.write(`data: ${JSON.stringify(s.pub())}\n\n`);
+    const ka = setInterval(() => res.write(': ka\n\n'), 20000);
+    return req.on('close', () => { clearInterval(ka); s.clients.delete(res); });
+  }
+  if (url === '/start' && req.method === 'POST') {
+    if (s.state !== 'connected' || s.running) { res.writeHead(409); return res.end('no listo'); }
+    let nums;
+    try { nums = [...new Set(JSON.parse(await body(req)).numbers.map(String))].filter(n => /^\d{8,15}$/.test(n)); }
+    catch { res.writeHead(400); return res.end('json inválido'); }
+    if (nums.length > MAX_NUMBERS) { res.writeHead(413); return res.end(`Máximo ${MAX_NUMBERS} números por corrida`); }
+    s.run(nums);
+    res.writeHead(200); return res.end('ok');
+  }
+  if (url === '/stop' && req.method === 'POST') { s.stop = true; res.writeHead(200); return res.end('ok'); }
+  if (url === '/logout' && req.method === 'POST') { await s.close(); res.writeHead(200); return res.end('ok'); }
+  if (url === '/results.csv') {
+    res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="resultados.csv"' });
+    return res.end(s.csv());
+  }
+  if (url === '/results-debug.csv') { // incluye el texto crudo que leyó WhatsApp, para calibrar
+    res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8' });
+    return res.end('phone,status,raw\n' + s.rows.map(r => `${r.phone},${r.status},"${r.raw.replace(/"/g, '""')}"`).join('\n'));
+  }
+  res.writeHead(404); res.end();
+}).listen(PORT, '0.0.0.0', () => console.log(`Escuchando en :${PORT} (máx ${MAX_SESSIONS} sesiones, headless=${HEADLESS})`));
+
+const shutdown = async () => { await Promise.all([...sessions.values()].map(s => s.close())); process.exit(0); };
+process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
