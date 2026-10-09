@@ -96,29 +96,38 @@ class Session {
     } catch {}
   }
 
+  // Pega el número de una sola vez (una búsqueda en vez de una por dígito) y lee el panel apenas se estabiliza.
   async check(num) {
     const { page } = this;
     this.halt();
     await this.openPanel();
     const caja = this.caja();
-    this.halt();
-    await caja.click();
+    await caja.focus();
     await page.keyboard.press('Control+A');   // borra el número anterior
     await page.keyboard.press('Backspace');
-    await page.keyboard.type(num, { delay: DELAY_TECLA });
-    await this.wait(ESPERA_RESULTADO);
+    await page.keyboard.insertText(num);      // un solo evento de entrada, sin tipear tecla por tecla
     this.halt();
-    const texto = await caja.evaluate(el => {
-      let n = el;
-      for (let i = 0; i < 8 && n.parentElement; i++) {
-        n = n.parentElement;
-        if (n.querySelector('[role="listitem"], [role="list"], [role="grid"]')) break;
+    const r = await caja.evaluate((el, minMs, maxMs) => new Promise(resolve => {
+      let panel = el;
+      for (let i = 0; i < 8 && panel.parentElement; i++) {
+        panel = panel.parentElement;
+        if (panel.querySelector('[role="listitem"], [role="list"], [role="grid"]')) break;
       }
-      return n.innerText;
-    });
-    const hayResultado = (await page.locator('[role="listitem"], [role="gridcell"]').count()) > 0;
-    const t = texto.replace(/\s*\n\s*/g, ' | ').trim();
-    return { phone: num, status: !NEG.test(t) && hayResultado ? 'yes' : 'no', raw: t };
+      const t0 = Date.now();
+      let last = panel.innerText, lastChange = t0;
+      const tick = () => {
+        const cur = panel.innerText, now = Date.now();
+        if (cur !== last) { last = cur; lastChange = now; }
+        // listo: pasó el mínimo y el panel dejó de cambiar 200 ms (o se agotó el máximo)
+        if ((now - t0 >= minMs && now - lastChange >= 200) || now - t0 >= maxMs) {
+          return resolve({ text: cur, count: panel.querySelectorAll('[role="listitem"], [role="gridcell"]').length, waited: now - t0 });
+        }
+        setTimeout(tick, 40);
+      };
+      tick();
+    }), ESPERA_RESULTADO, 3000);
+    const t = r.text.replace(/\s*\n\s*/g, ' | ').trim();
+    return { phone: num, status: !NEG.test(t) && r.count > 0 ? 'yes' : 'no', raw: `[${r.waited}ms] ` + t };
   }
 
   async run(numbers) {
