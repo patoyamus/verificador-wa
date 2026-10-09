@@ -38,7 +38,7 @@ class Session {
   touch() { this.touched = Date.now(); }
   pub() {
     return {
-      state: this.state, qr: this.qr, running: this.running, stopping: this.running && this.stop,
+      state: this.state, qr: this.qr, running: this.running, stopping: this.running && this.stop, error: this.error || null,
       total: this.total, done: this.rows.length,
       yes: this.rows.filter(r => r.status === 'yes').length,
       no: this.rows.filter(r => r.status === 'no').length,
@@ -54,6 +54,7 @@ class Session {
       args: ['--no-sandbox', '--disable-dev-shm-usage'],
     });
     this.page = this.ctx.pages()[0] || await this.ctx.newPage();
+    this.page.setDefaultTimeout(8000); // fallar rápido, no esperar 30 s
     await this.page.goto('https://web.whatsapp.com');
     while (!this.closed) {
       try {
@@ -76,12 +77,27 @@ class Session {
   async wait(ms) { for (let t = 0; t < ms && !this.stop; t += 200) await sleep(200); }
   halt() { if (this.stop) throw new Error('stopped'); }
 
-  caja() { return this.page.locator('[contenteditable="true"][role="textbox"]').first(); }
+  // El buscador de "Nuevo chat" es un <input role="textbox"> (versiones viejas: contenteditable)
+  caja() { return this.page.locator('input[role="textbox"], input[type="text"], [contenteditable="true"][role="textbox"]').first(); }
 
   // Abre "Nuevo chat" una sola vez; queda abierto durante toda la lista
+  // Cierra carteles que tapan la pantalla ("Novedades", avisos, etc.)
+  async dismissDialogs() {
+    for (let i = 0; i < 3; i++) {
+      const d = this.page.locator('[role="dialog"]').first();
+      if (!(await d.isVisible().catch(() => false))) return;
+      const btn = d.getByRole('button', { name: /continuar|continue|aceptar|accept|entendido|got it|ok|cerrar|close/i }).first();
+      if (await btn.count()) await btn.click({ timeout: 3000 }).catch(() => {});
+      else await this.page.keyboard.press('Escape');
+      await sleep(300);
+    }
+  }
+
   async openPanel() {
     if (this.panelOpen) return;
-    await this.nuevoChat().click();
+    await this.dismissDialogs();
+    try { await this.nuevoChat().click({ timeout: 4000 }); }
+    catch { await this.dismissDialogs(); await this.nuevoChat().click({ timeout: 4000 }); }
     await this.caja().waitFor({ timeout: 8000 });
     this.panelOpen = true;
   }
@@ -107,7 +123,7 @@ class Session {
     await page.keyboard.press('Backspace');
     await page.keyboard.insertText(num);      // un solo evento de entrada, sin tipear tecla por tecla
     this.halt();
-    const r = await caja.evaluate((el, minMs, maxMs) => new Promise(resolve => {
+    const r = await caja.evaluate((el, { minMs, maxMs, num }) => new Promise(resolve => {
       let panel = el;
       for (let i = 0; i < 8 && panel.parentElement; i++) {
         panel = panel.parentElement;
@@ -118,27 +134,31 @@ class Session {
       const tick = () => {
         const cur = panel.innerText, now = Date.now();
         if (cur !== last) { last = cur; lastChange = now; }
-        // listo: pasó el mínimo y el panel dejó de cambiar 200 ms (o se agotó el máximo)
-        if ((now - t0 >= minMs && now - lastChange >= 200) || now - t0 >= maxMs) {
+        // listo: pasó el mínimo, el panel dejó de cambiar 150 ms y ya menciona el número buscado
+        // (así no se lee el resultado del número anterior); o se agotó el máximo
+        const mencionaNumero = cur.replace(/\D/g, '').includes(num);
+        if ((now - t0 >= minMs && now - lastChange >= 150 && mencionaNumero) || now - t0 >= maxMs) {
           return resolve({ text: cur, count: panel.querySelectorAll('[role="listitem"], [role="gridcell"]').length, waited: now - t0 });
         }
         setTimeout(tick, 40);
       };
       tick();
-    }), ESPERA_RESULTADO, 3000);
+    }), { minMs: ESPERA_RESULTADO, maxMs: 2500, num });
     const t = r.text.replace(/\s*\n\s*/g, ' | ').trim();
     return { phone: num, status: !NEG.test(t) && r.count > 0 ? 'yes' : 'no', raw: `[${r.waited}ms] ` + t };
   }
 
   async run(numbers) {
-    this.running = true; this.stop = false; this.rows = []; this.total = numbers.length; this.push();
+    this.running = true; this.stop = false; this.error = null; this.rows = [];
+    let fallos = 0; this.total = numbers.length; this.push();
     for (const n of numbers) {
       if (this.stop || this.closed) break;
-      try { this.rows.push(await this.check(n)); }
+      try { this.rows.push(await this.check(n)); fallos = 0; }
       catch (e) {
         await this.closePanel(); // ante cualquier falla se reabre limpio en el próximo número
         if (e.message === 'stopped') break; // el número interrumpido no se cuenta
         this.rows.push({ phone: n, status: 'no', raw: 'error: ' + e.message.split('\n')[0] });
+        if (++fallos >= 3) { this.error = 'No pude operar WhatsApp Web (3 fallos seguidos): ' + e.message.split('\n')[0]; break; }
       }
       this.touch(); this.push();
       if (PAUSE_MAX > 0) await this.wait(PAUSE_MIN + Math.random() * (PAUSE_MAX - PAUSE_MIN));
@@ -225,6 +245,26 @@ http.createServer(async (req, res) => {
   }
   if (url === '/stop' && req.method === 'POST') { s.stop = true; s.push(); res.writeHead(200); return res.end('ok'); }
   if (url === '/logout' && req.method === 'POST') { await s.close(true); res.writeHead(200); return res.end('ok'); }
+  if (url === '/screenshot.png' && process.env.DEBUG_SCREENSHOT === '1') { // solo diagnóstico
+    try { const png = await s.page.screenshot(); res.writeHead(200, { 'Content-Type': 'image/png' }); return res.end(png); }
+    catch { res.writeHead(500); return res.end('sin página'); }
+  }
+  if (url === '/debug-check' && process.env.DEBUG_SCREENSHOT === '1') { // solo diagnóstico: un número, panel queda abierto
+    try {
+      const n = (new URL(req.url, 'http://x').searchParams.get('n') || '').replace(/\D/g, '');
+      const t0 = Date.now(); const r = await s.check(n);
+      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ...r, ms: Date.now() - t0 }, null, 1));
+    } catch (e) { res.writeHead(500); return res.end(String(e)); }
+  }
+  if (url === '/debug-dom' && process.env.DEBUG_SCREENSHOT === '1') { // solo diagnóstico: describe los campos de texto
+    try {
+      const info = await s.page.evaluate(() => [...document.querySelectorAll('input, [contenteditable], [role="textbox"], [role="searchbox"]')].map(e => ({
+        tag: e.tagName, type: e.type || null, role: e.getAttribute('role'), ce: e.getAttribute('contenteditable'),
+        aria: e.getAttribute('aria-label'), ph: e.getAttribute('placeholder'), title: e.getAttribute('title'),
+        visible: !!(e.offsetWidth || e.offsetHeight), focused: document.activeElement === e, text: (e.innerText || e.value || '').slice(0, 40) })));
+      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(info, null, 1));
+    } catch (e) { res.writeHead(500); return res.end(String(e)); }
+  }
   if (url === '/results.csv') {
     res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="resultados.csv"' });
     return res.end(s.csv());
