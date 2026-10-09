@@ -15,8 +15,10 @@ const MAX_NUMBERS = +process.env.MAX_NUMBERS || 200;      // por corrida
 const IDLE_MS = (+process.env.IDLE_MIN || 10) * 60 * 1000;
 const BASE_DIR = process.env.SESSIONS_DIR || path.join(os.tmpdir(), 'wa-sessions');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const DELAY_TECLA = 70;
-const ESPERA_RESULTADO = 2200;
+const DELAY_TECLA = +process.env.TYPE_DELAY_MS || 70;     // ms entre dígitos
+const ESPERA_RESULTADO = +process.env.WAIT_MS || 500;      // espera a que WhatsApp muestre su respuesta
+const PAUSE_MIN = +process.env.PAUSE_MIN_MS || 0;          // pausa extra entre números (anti-baneo)
+const PAUSE_MAX = +process.env.PAUSE_MAX_MS || 0;
 
 // Textos con los que WhatsApp indica que el número no existe / no hay resultados
 const NEG = /not on whatsapp|isn.t on whatsapp|no est[aá] en whatsapp|no results|no se encontr|sin resultados|invalid|inv[aá]lid|not found/i;
@@ -71,14 +73,35 @@ class Session {
   async wait(ms) { for (let t = 0; t < ms && !this.stop; t += 200) await sleep(200); }
   halt() { if (this.stop) throw new Error('stopped'); }
 
+  caja() { return this.page.locator('[contenteditable="true"][role="textbox"]').first(); }
+
+  // Abre "Nuevo chat" una sola vez; queda abierto durante toda la lista
+  async openPanel() {
+    if (this.panelOpen) return;
+    await this.nuevoChat().click();
+    await this.caja().waitFor({ timeout: 8000 });
+    this.panelOpen = true;
+  }
+
+  async closePanel() {
+    if (!this.panelOpen) return;
+    this.panelOpen = false;
+    try {
+      await this.page.keyboard.press('Control+A');
+      await this.page.keyboard.press('Backspace');
+      await this.page.keyboard.press('Escape'); // cierra el panel; nunca Enter, nunca abre un chat
+    } catch {}
+  }
+
   async check(num) {
     const { page } = this;
     this.halt();
-    await this.nuevoChat().click();
-    const caja = page.locator('[contenteditable="true"][role="textbox"]').first();
-    await caja.waitFor({ timeout: 8000 });
+    await this.openPanel();
+    const caja = this.caja();
     this.halt();
     await caja.click();
+    await page.keyboard.press('Control+A');   // borra el número anterior
+    await page.keyboard.press('Backspace');
     await page.keyboard.type(num, { delay: DELAY_TECLA });
     await this.wait(ESPERA_RESULTADO);
     this.halt();
@@ -91,9 +114,6 @@ class Session {
       return n.innerText;
     });
     const hayResultado = (await page.locator('[role="listitem"], [role="gridcell"]').count()) > 0;
-    await page.keyboard.press('Control+A');
-    await page.keyboard.press('Backspace');
-    await page.keyboard.press('Escape'); // cierra el panel; nunca Enter, nunca abre un chat
     const t = texto.replace(/\s*\n\s*/g, ' | ').trim();
     return { phone: num, status: !NEG.test(t) && hayResultado ? 'yes' : 'no', raw: t };
   }
@@ -104,13 +124,14 @@ class Session {
       if (this.stop || this.closed) break;
       try { this.rows.push(await this.check(n)); }
       catch (e) {
-        try { await this.page.keyboard.press('Control+A'); await this.page.keyboard.press('Backspace'); await this.page.keyboard.press('Escape'); } catch {}
+        await this.closePanel(); // ante cualquier falla se reabre limpio en el próximo número
         if (e.message === 'stopped') break; // el número interrumpido no se cuenta
         this.rows.push({ phone: n, status: 'no', raw: 'error: ' + e.message.split('\n')[0] });
       }
       this.touch(); this.push();
-      await this.wait(1200 + Math.random() * 1500);
+      if (PAUSE_MAX > 0) await this.wait(PAUSE_MIN + Math.random() * (PAUSE_MAX - PAUSE_MIN));
     }
+    await this.closePanel();
     this.running = false; this.touch(); this.push();
   }
 
