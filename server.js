@@ -18,13 +18,14 @@ const IDLE_MS = (+process.env.IDLE_MIN || 10) * 60 * 1000;
 const KEEP = process.env.KEEP_SESSION === '1';
 const BASE_DIR = process.env.SESSIONS_DIR || path.join(os.tmpdir(), 'wa-sessions');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const DELAY_TECLA = +process.env.TYPE_DELAY_MS || 70;     // ms entre dígitos
+const SYNC_MS = +process.env.SYNC_WAIT_MS || 45000;        // espera tras vincular, mientras WhatsApp sincroniza
+const DELAY_TECLA = +process.env.TYPE_DELAY_MS || 70;    // ms entre dígitos
 const ESPERA_RESULTADO = +process.env.WAIT_MS || 500;      // espera a que WhatsApp muestre su respuesta
 const PAUSE_MIN = +process.env.PAUSE_MIN_MS || 0;          // pausa extra entre números (anti-baneo)
 const PAUSE_MAX = +process.env.PAUSE_MAX_MS || 0;
 
 // --- Plan gratis, cuentas y cupo -------------------------------------------------------
-const FREE_LIMIT = +process.env.FREE_LIMIT || 100;                 // verificaciones gratis por cuenta (de por vida)
+const FREE_LIMIT = +process.env.FREE_LIMIT || 50;                  // verificaciones gratis por cuenta (de por vida)
 const KEYS_PER_IP_DAY = +process.env.KEYS_PER_IP_DAY || 10;        // cuentas nuevas por IP y por día
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const ACC_FILE = path.join(DATA_DIR, 'accounts.json');
@@ -91,7 +92,11 @@ class Session {
       try {
         if (this.running) { await sleep(1500); continue; }
         if (await this.nuevoChat().isVisible()) {
-          if (this.state !== 'connected') { this.state = 'connected'; this.qr = null; this.push(); }
+          if (this.state !== 'connected') {
+            // recién vinculado: WhatsApp sigue sincronizando y las búsquedas pueden dar falsos "no"
+            if (this.state === 'qr') this.syncUntil = Date.now() + SYNC_MS;
+            this.state = 'connected'; this.qr = null; this.push();
+          }
         } else {
           const canvas = this.page.locator('canvas').first();
           if (await canvas.isVisible()) {
@@ -176,7 +181,10 @@ class Session {
       tick();
     }), { minMs: ESPERA_RESULTADO, maxMs: 2500, num });
     const t = r.text.replace(/\s*\n\s*/g, ' | ').trim();
-    return { phone: num, status: !NEG.test(t) && r.count > 0 ? 'yes' : 'no', raw: `[${r.waited}ms] ` + t };
+    // "no" solo con el mensaje explícito de WhatsApp; si no hay ni resultado ni mensaje, es "error" (no se sabe)
+    const negativo = NEG.test(t);
+    const status = r.count > 0 && !negativo ? 'yes' : (negativo ? 'no' : 'error');
+    return { phone: num, status, raw: `[${r.waited}ms] ` + t };
   }
 
   async run(numbers, truncated = false) {
@@ -190,7 +198,13 @@ class Session {
     for (const n of numbers) {
       if (this.stop || this.closed) break;
       if (acc.used >= acc.limit) { this.error = `Agotaste las ${acc.limit} verificaciones gratis.`; break; }
-      try { this.rows.push(await this.check(n)); acc.used++; saveAccounts(); fallos = 0; }
+      try {
+        const row = await this.check(n);
+        this.rows.push(row);
+        if (row.status === 'error') { // respuesta indeterminada: no descuenta cupo y cuenta como fallo
+          if (++fallos >= 3) { this.error = 'WhatsApp no devolvió resultados claros (3 seguidos). Probá de nuevo en unos minutos.'; break; }
+        } else { acc.used++; saveAccounts(); fallos = 0; }
+      }
       catch (e) {
         await this.closePanel(); // ante cualquier falla se reabre limpio en el próximo número
         if (e.message === 'stopped') break; // el número interrumpido no se cuenta
@@ -262,6 +276,10 @@ function authOf(req) {
 function launch(s, rawBody) {
   if (s.state !== 'connected') return { status: 409, code: 'session_not_ready', message: 'WhatsApp todavía no está conectado.' };
   if (s.running) return { status: 409, code: 'job_running', message: 'Ya hay una verificación en curso.' };
+  if (s.syncUntil && Date.now() < s.syncUntil) {
+    const seg = Math.ceil((s.syncUntil - Date.now()) / 1000);
+    return { status: 409, code: 'session_syncing', message: `WhatsApp está sincronizando tu cuenta. Esperá ${seg} segundos y probá de nuevo.` };
+  }
   let nums;
   try {
     const list = JSON.parse(rawBody).numbers;
@@ -396,6 +414,13 @@ http.createServer(async (req, res) => {
   if (url === '/screenshot.png' && process.env.DEBUG_SCREENSHOT === '1') { // solo diagnóstico
     try { const png = await s.page.screenshot(); res.writeHead(200, { 'Content-Type': 'image/png' }); return res.end(png); }
     catch { res.writeHead(500); return res.end('sin página'); }
+  }
+  if (url === '/debug-check' && process.env.DEBUG_SCREENSHOT === '1') { // solo diagnóstico: un número, panel queda abierto
+    try {
+      const n = (new URL(req.url, 'http://x').searchParams.get('n') || '').replace(/\D/g, '');
+      const t0 = Date.now(); const r = await s.check(n);
+      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ...r, ms: Date.now() - t0 }));
+    } catch (e) { res.writeHead(500); return res.end(String(e)); }
   }
   if (url === '/results.csv') {
     res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="resultados.csv"' });

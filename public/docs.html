@@ -18,7 +18,7 @@ td,th{border-top:1px solid var(--bd);padding:7px 6px;text-align:left}th{color:va
 <p>Comprobá si una lista de teléfonos tiene WhatsApp. <a href="/">← Volver a la app</a></p>
 
 <h2>Plan gratis</h2>
-<p><b>100 verificaciones</b> por cuenta. Se descuentan solo las que se completan: un error no cuenta. Al agotarlas, la API responde <code>402 quota_exceeded</code>.</p>
+<p><b>50 verificaciones</b> por cuenta. Se descuentan solo las que se completan: un error no cuenta. Al agotarlas, la API responde <code>402 quota_exceeded</code>.</p>
 
 <h2>Cómo funciona</h2>
 <p>Cada cuenta vincula <b>su propio WhatsApp</b> (como "Dispositivos vinculados"). El servicio solo escribe el número en el buscador de "Nuevo chat" y lee el resultado: <b>nunca envía mensajes</b>. Tu sesión se borra al cerrarla o tras 10 minutos sin uso.</p>
@@ -35,7 +35,7 @@ td,th{border-top:1px solid var(--bd);padding:7px 6px;text-align:left}th{color:va
 <p><span class="tag">POST</span><code>/v1/keys</code></p>
 <pre>curl -X POST https://TU-DOMINIO/v1/keys
 
-{ "api_key": "wak_3f9c…", "plan": "free", "limit": 100, "used": 0, "remaining": 100 }</pre>
+{ "api_key": "wak_3f9c…", "plan": "free", "limit": 50, "used": 0, "remaining": 50 }</pre>
 
 <h2>2 · Abrir sesión y obtener el QR</h2>
 <p><span class="tag">POST</span><code>/v1/session</code> &nbsp; <span class="tag">GET</span><code>/v1/session</code></p>
@@ -43,7 +43,7 @@ td,th{border-top:1px solid var(--bd);padding:7px 6px;text-align:left}th{color:va
 curl https://TU-DOMINIO/v1/session -H "Authorization: Bearer $KEY"
 
 { "state": "qr", "qr": "&lt;PNG en base64&gt;", "running": false }</pre>
-<p><code>state</code>: <code>loading</code> → <code>qr</code> → <code>connected</code>. La primera vez el QR tarda unos 20 a 40 segundos. Mostralo como <code>data:image/png;base64,…</code>.</p>
+<p><code>state</code>: <code>loading</code> → <code>qr</code> → <code>connected</code>. La primera vez el QR tarda unos 20 a 40 segundos. Al vincular, WhatsApp sincroniza ~45 segundos: antes de eso <code>POST /v1/checks</code> responde <code>409 session_syncing</code>. Mostralo como <code>data:image/png;base64,…</code>.</p>
 
 <h2>3 · Verificar números</h2>
 <p><span class="tag">POST</span><code>/v1/checks</code></p>
@@ -52,7 +52,7 @@ curl https://TU-DOMINIO/v1/session -H "Authorization: Bearer $KEY"
   -d '{"numbers": ["5491122334455", "5492994713247"]}'
 
 { "id": "job_9a1c…", "status": "running", "total": 2, "truncated": false,
-  "quota": { "limit": 100, "used": 0, "remaining": 100 } }</pre>
+  "quota": { "limit": 50, "used": 0, "remaining": 50 } }</pre>
 <p>Los números van con código de país (8 a 15 dígitos). Máximo 200 por pedido. Si pedís más de lo que te queda, se procesan los que alcanzan y <code>truncated</code> es <code>true</code>.</p>
 
 <h2>4 · Leer el resultado</h2>
@@ -76,14 +76,14 @@ curl https://TU-DOMINIO/v1/session -H "Authorization: Bearer $KEY"
 </table>
 
 <h2>Errores</h2>
-<pre>{ "error": { "code": "quota_exceeded", "message": "Usaste tus 100 verificaciones gratis." } }</pre>
+<pre>{ "error": { "code": "quota_exceeded", "message": "Usaste tus 50 verificaciones gratis." } }</pre>
 <table>
 <tr><th>HTTP</th><th>code</th></tr>
 <tr><td>400</td><td><code>invalid_body</code>, <code>no_valid_numbers</code></td></tr>
 <tr><td>401</td><td><code>unauthorized</code>, <code>invalid_key</code></td></tr>
 <tr><td>402</td><td><code>quota_exceeded</code></td></tr>
 <tr><td>404</td><td><code>job_not_found</code></td></tr>
-<tr><td>409</td><td><code>no_session</code>, <code>session_not_ready</code>, <code>job_running</code></td></tr>
+<tr><td>409</td><td><code>no_session</code>, <code>session_not_ready</code>, <code>session_syncing</code>, <code>job_running</code></td></tr>
 <tr><td>413</td><td><code>too_many_numbers</code></td></tr>
 <tr><td>429</td><td><code>rate_limited</code></td></tr>
 <tr><td>503</td><td><code>server_busy</code></td></tr>
