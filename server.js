@@ -176,6 +176,7 @@ http.createServer(async (req, res) => {
     let nums;
     try { nums = [...new Set(JSON.parse(await body(req)).numbers.map(String))].filter(n => /^\d{8,15}$/.test(n)); }
     catch { res.writeHead(400); return res.end('json inválido'); }
+    if (!nums.length) { res.writeHead(400); return res.end('Ningún número válido: deben tener entre 8 y 15 dígitos, con código de país (ej. 5491122334455).'); }
     if (nums.length > MAX_NUMBERS) { res.writeHead(413); return res.end(`Máximo ${MAX_NUMBERS} números por corrida`); }
     s.run(nums);
     res.writeHead(200); return res.end('ok');

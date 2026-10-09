@@ -100,13 +100,17 @@ function parse(t) {
     const i = sp(L[0]).findIndex(c => /phone|tel|cel|numero|número|number|whats/i.test(c));
     col = i >= 0 ? i : 0; rows = L.slice(1);
   }
-  return rows.map(l => (sp(l)[col] || '').replace(/\D/g, '')).filter(n => n.length >= 8);
+  parse.ignored = 0;
+  return rows.map(l => (sp(l)[col] || '').replace(/\D/g, '')).filter(n => {
+    const ok = n.length >= 8 && n.length <= 15; if (!ok) parse.ignored++; return ok;
+  });
 }
 
 $('file').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   numbers = [...new Set(parse(await f.text()))];
-  $('info').textContent = numbers.length ? numbers.length + ' números válidos detectados' : 'No encontré teléfonos en el archivo';
+  const ign = parse.ignored ? ` (${parse.ignored} ignorados: deben tener 8 a 15 dígitos)` : '';
+  $('info').textContent = numbers.length ? numbers.length + ' números válidos detectados' + ign : 'No encontré teléfonos válidos en el archivo' + ign;
   $('run').classList.toggle('hide', !numbers.length);
 };
 $('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('on'); };
