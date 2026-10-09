@@ -25,10 +25,16 @@ table{width:100%;border-collapse:collapse;margin-top:16px;font-size:14px;text-al
 td{padding:6px 4px;border-top:1px solid var(--bd)}
 .ok{color:var(--g);font-weight:700}.ko{color:var(--r);font-weight:700}
 .row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:16px}
+.plan{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px;color:var(--mut);margin:-12px -12px 20px;padding:10px 14px;border:1px solid var(--bd);border-radius:10px;text-align:left}
+.plan a{color:var(--g);font-weight:600;text-decoration:none}.plan b{color:var(--tx)}
 .spin{width:36px;height:36px;border:4px solid var(--bd);border-top-color:var(--g);border-radius:50%;animation:s 1s linear infinite;margin:16px auto}
 @keyframes s{to{transform:rotate(360deg)}}
 </style></head><body>
 <div class="card">
+  <div class="plan">
+    <span>Plan gratis: <b id="rem">–</b> de <span id="lim">100</span> verificaciones disponibles</span>
+    <span><a href="/docs">API</a> · <a href="#" id="key">Copiar mi API key</a></span>
+  </div>
   <section id="s1">
     <h1>Verificador de WhatsApp</h1>
     <p>Subí una lista de teléfonos y te devuelvo cuáles tienen WhatsApp.<br>No se envía ningún mensaje.</p>
@@ -80,6 +86,18 @@ td{padding:6px 4px;border-top:1px solid var(--bd)}
 const $ = id => document.getElementById(id);
 let step = 1, started = false, numbers = [];
 const show = n => { step = n; for (let i = 1; i <= 5; i++) $('s' + i).classList.toggle('hide', i !== n); };
+
+function showQuota(q) { $('rem').textContent = q.remaining; $('lim').textContent = q.limit; }
+fetch('/v1/account').then(r => r.json()).then(showQuota).catch(() => {});
+$('key').onclick = async e => {
+  e.preventDefault();
+  try {
+    const a = await (await fetch('/v1/account')).json();
+    await navigator.clipboard.writeText(a.api_key);
+    $('key').textContent = '¡API key copiada!';
+  } catch { $('key').textContent = 'No pude copiarla'; }
+  setTimeout(() => { $('key').textContent = 'Copiar mi API key'; }, 2500);
+};
 
 $('go').onclick = async () => {
   $('go').disabled = true;
@@ -136,6 +154,7 @@ function listen() {
 const es = new EventSource('/events');
 es.onmessage = e => {
   const s = JSON.parse(e.data);
+  if (s.quota) showQuota(s.quota);
   if (step === 2) {
     if (s.state === 'connected') show(3);
     else if (s.state === 'qr') {

@@ -23,6 +23,36 @@ const ESPERA_RESULTADO = +process.env.WAIT_MS || 500;      // espera a que Whats
 const PAUSE_MIN = +process.env.PAUSE_MIN_MS || 0;          // pausa extra entre números (anti-baneo)
 const PAUSE_MAX = +process.env.PAUSE_MAX_MS || 0;
 
+// --- Plan gratis, cuentas y cupo -------------------------------------------------------
+const FREE_LIMIT = +process.env.FREE_LIMIT || 100;                 // verificaciones gratis por cuenta (de por vida)
+const KEYS_PER_IP_DAY = +process.env.KEYS_PER_IP_DAY || 10;        // cuentas nuevas por IP y por día
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const ACC_FILE = path.join(DATA_DIR, 'accounts.json');
+let accounts = {};
+try { accounts = JSON.parse(fs.readFileSync(ACC_FILE, 'utf8')); } catch {}
+let saveTimer = null;
+function saveAccounts() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(ACC_FILE + '.tmp', JSON.stringify(accounts));
+      fs.renameSync(ACC_FILE + '.tmp', ACC_FILE);
+    } catch (e) { console.error('no pude guardar las cuentas:', e.message); }
+  }, 300);
+}
+function getAccount(id, create = true) {
+  if (!accounts[id] && create) {
+    accounts[id] = { created: new Date().toISOString(), plan: 'free', limit: FREE_LIMIT, used: 0 };
+    saveAccounts();
+  }
+  return accounts[id];
+}
+const accPub = (a, id, withKey) => ({
+  plan: a.plan, limit: a.limit, used: a.used, remaining: Math.max(0, a.limit - a.used),
+  ...(withKey ? { api_key: 'wak_' + id } : {}),
+});
+
 // Textos con los que WhatsApp indica que el número no existe / no hay resultados
 const NEG = /not on whatsapp|isn.t on whatsapp|no est[aá] en whatsapp|no results|no se encontr|sin resultados|invalid|inv[aá]lid|not found/i;
 
@@ -33,7 +63,7 @@ class Session {
   constructor(id) {
     this.id = id; this.dir = path.join(BASE_DIR, id);
     this.state = 'starting'; this.qr = null; this.running = false; this.stop = false;
-    this.total = 0; this.rows = []; this.clients = new Set(); this.touched = Date.now(); this.closed = false;
+    this.total = 0; this.rows = []; this.jobs = new Map(); this.job = null; this.clients = new Set(); this.touched = Date.now(); this.closed = false;
   }
   touch() { this.touched = Date.now(); }
   pub() {
@@ -42,6 +72,7 @@ class Session {
       total: this.total, done: this.rows.length,
       yes: this.rows.filter(r => r.status === 'yes').length,
       no: this.rows.filter(r => r.status === 'no').length,
+      errors: this.rows.filter(r => r.status === 'error').length,
       last: this.rows.slice(-12).reverse(),
     };
   }
@@ -148,23 +179,42 @@ class Session {
     return { phone: num, status: !NEG.test(t) && r.count > 0 ? 'yes' : 'no', raw: `[${r.waited}ms] ` + t };
   }
 
-  async run(numbers) {
+  async run(numbers, truncated = false) {
+    const acc = getAccount(this.id);
     this.running = true; this.stop = false; this.error = null; this.rows = [];
+    const job = { id: 'job_' + crypto.randomBytes(6).toString('hex'), status: 'running', total: numbers.length,
+      truncated, created: new Date().toISOString(), rows: this.rows, error: null };
+    this.jobs.set(job.id, job); this.job = job;
+    if (this.jobs.size > 5) this.jobs.delete(this.jobs.keys().next().value);
     let fallos = 0; this.total = numbers.length; this.push();
     for (const n of numbers) {
       if (this.stop || this.closed) break;
-      try { this.rows.push(await this.check(n)); fallos = 0; }
+      if (acc.used >= acc.limit) { this.error = `Agotaste las ${acc.limit} verificaciones gratis.`; break; }
+      try { this.rows.push(await this.check(n)); acc.used++; saveAccounts(); fallos = 0; }
       catch (e) {
         await this.closePanel(); // ante cualquier falla se reabre limpio en el próximo número
         if (e.message === 'stopped') break; // el número interrumpido no se cuenta
-        this.rows.push({ phone: n, status: 'no', raw: 'error: ' + e.message.split('\n')[0] });
-        if (++fallos >= 3) { this.error = 'No pude operar WhatsApp Web (3 fallos seguidos): ' + e.message.split('\n')[0]; break; }
+        // un error no es un "no": queda aparte y no descuenta del cupo
+        const motivo = e.message.split('\n')[0];
+        this.rows.push({ phone: n, status: 'error', raw: 'error: ' + motivo });
+        if (++fallos >= 3) { this.error = 'No pude operar WhatsApp Web (3 fallos seguidos): ' + motivo; break; }
       }
       this.touch(); this.push();
       if (PAUSE_MAX > 0) await this.wait(PAUSE_MIN + Math.random() * (PAUSE_MAX - PAUSE_MIN));
     }
     await this.closePanel();
+    job.status = this.error ? 'error' : (this.stop ? 'stopped' : 'done'); job.error = this.error;
     this.running = false; this.touch(); this.push();
+  }
+
+  jobPub(job, full = true) {
+    const rows = job.rows;
+    return {
+      id: job.id, status: job.status, total: job.total, done: rows.length, truncated: job.truncated,
+      yes: rows.filter(r => r.status === 'yes').length, no: rows.filter(r => r.status === 'no').length,
+      errors: rows.filter(r => r.status === 'error').length, error: job.error, created: job.created,
+      ...(full ? { results: rows.map(r => ({ phone: r.phone, status: r.status })) } : {}),
+    };
   }
 
   csv() { return 'phone,status\n' + this.rows.map(r => `${r.phone},${r.status}`).join('\n'); }
@@ -188,32 +238,135 @@ setInterval(() => {
   }
 }, 30000);
 
-const cookieId = req => (/(?:^|;\s*)sid=([a-f0-9]{32})/.exec(req.headers.cookie || '') || [])[1];
 const body = req => new Promise(r => { let b = ''; req.on('data', c => { b += c; if (b.length > 5e6) req.destroy(); }); req.on('end', () => r(b)); });
+const sendJson = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+const apiErr = (res, code, errCode, message, extra = {}) => sendJson(res, code, { error: { code: errCode, message, ...extra } });
+const clientIp = req => req.headers['cf-connecting-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '';
+const ipKeys = new Map(); // ip -> { day, n }
+const ipAllowed = ip => {
+  const day = new Date().toISOString().slice(0, 10), e = ipKeys.get(ip);
+  if (!e || e.day !== day) { ipKeys.set(ip, { day, n: 1 }); return true; }
+  return ++e.n <= KEYS_PER_IP_DAY;
+};
+
+// Identifica al cliente: API key (Authorization: Bearer wak_… / X-API-Key) o la cookie del navegador.
+function authOf(req) {
+  const h = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') || req.headers['x-api-key'] || '';
+  const m = /^wak_([a-f0-9]{32})$/.exec(String(h).trim());
+  if (m) return { id: m[1], viaKey: true };
+  const c = (/(?:^|;\s*)sid=([a-f0-9]{32})/.exec(req.headers.cookie || '') || [])[1];
+  return c ? { id: c, viaKey: false } : null;
+}
+
+// Valida y lanza una corrida; la usan la web (/start) y la API (POST /v1/checks).
+function launch(s, rawBody) {
+  if (s.state !== 'connected') return { status: 409, code: 'session_not_ready', message: 'WhatsApp todavía no está conectado.' };
+  if (s.running) return { status: 409, code: 'job_running', message: 'Ya hay una verificación en curso.' };
+  let nums;
+  try {
+    const list = JSON.parse(rawBody).numbers;
+    if (!Array.isArray(list)) throw new Error('numbers');
+    nums = [...new Set(list.map(n => String(n).replace(/\D/g, '')))].filter(n => /^\d{8,15}$/.test(n));
+  } catch { return { status: 400, code: 'invalid_body', message: 'Enviá JSON con {"numbers": ["5491122334455", …]}.' }; }
+  if (!nums.length) return { status: 400, code: 'no_valid_numbers', message: 'Ningún número válido: deben tener entre 8 y 15 dígitos, con código de país (ej. 5491122334455).' };
+  if (nums.length > MAX_NUMBERS) return { status: 413, code: 'too_many_numbers', message: `Máximo ${MAX_NUMBERS} números por pedido.` };
+  const acc = getAccount(s.id);
+  const left = Math.max(0, acc.limit - acc.used);
+  if (left === 0) return { status: 402, code: 'quota_exceeded', message: `Usaste tus ${acc.limit} verificaciones gratis.`, quota: accPub(acc, s.id) };
+  const truncated = nums.length > left;
+  if (truncated) nums = nums.slice(0, left);
+  s.run(nums, truncated);
+  return { status: 202, id: s.job.id, total: nums.length, truncated, quota: accPub(acc, s.id) };
+}
+
+function openSession(id) {
+  const cur = sessions.get(id);
+  if (cur) return cur;
+  if (sessions.size >= MAX_SESSIONS) return null;
+  const ns = new Session(id); sessions.set(id, ns);
+  ns.start().catch(() => ns.close(!KEEP));
+  return ns;
+}
+
+async function api(req, res, url) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-API-Key');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+
+  if (url === '/v1/keys' && req.method === 'POST') { // alta de cuenta gratis
+    if (!ipAllowed(clientIp(req))) return apiErr(res, 429, 'rate_limited', 'Demasiadas cuentas nuevas desde esta red hoy. Probá mañana.');
+    const id = crypto.randomBytes(16).toString('hex');
+    return sendJson(res, 201, { ...accPub(getAccount(id), id, true), note: 'Guardá la API key: no se puede recuperar.' });
+  }
+
+  const a = authOf(req);
+  if (!a) return apiErr(res, 401, 'unauthorized', 'Falta la API key. Usá el encabezado Authorization: Bearer wak_…');
+  if (a.viaKey && !accounts[a.id]) return apiErr(res, 401, 'invalid_key', 'API key inválida.');
+  const acc = getAccount(a.id);
+  const s = sessions.get(a.id);
+  if (s) s.touch();
+
+  if (url === '/v1/account' && req.method === 'GET') return sendJson(res, 200, accPub(acc, a.id, !a.viaKey));
+
+  if (url === '/v1/session') {
+    if (req.method === 'POST') {
+      const ns = openSession(a.id);
+      if (!ns) return apiErr(res, 503, 'server_busy', 'El servidor está ocupado. Probá en unos minutos.');
+      return sendJson(res, 202, { state: ns.state });
+    }
+    if (req.method === 'GET') {
+      if (!s) return sendJson(res, 200, { state: 'none', qr: null });
+      return sendJson(res, 200, { state: s.state, qr: s.qr, running: s.running });
+    }
+    if (req.method === 'DELETE') { if (s) await s.close(true); return sendJson(res, 200, { state: 'none' }); }
+  }
+
+  if (url === '/v1/checks' && req.method === 'POST') {
+    if (!s) return apiErr(res, 409, 'no_session', 'Primero creá la sesión (POST /v1/session) y escaneá el QR.');
+    const out = launch(s, await body(req));
+    if (out.status !== 202) return apiErr(res, out.status, out.code, out.message, out.quota ? { quota: out.quota } : {});
+    return sendJson(res, 202, { id: out.id, status: 'running', total: out.total, truncated: out.truncated, quota: out.quota });
+  }
+
+  const m = /^\/v1\/checks\/(job_[a-f0-9]+)(\.csv)?$/.exec(url);
+  if (m && req.method === 'GET') {
+    const job = s && s.jobs.get(m[1]);
+    if (!job) return apiErr(res, 404, 'job_not_found', 'No existe ese pedido (o la sesión ya se cerró).');
+    if (m[2]) {
+      res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${job.id}.csv"` });
+      return res.end('phone,status\n' + job.rows.map(r => `${r.phone},${r.status}`).join('\n'));
+    }
+    return sendJson(res, 200, s.jobPub(job));
+  }
+
+  return apiErr(res, 404, 'not_found', 'Ruta no encontrada.');
+}
 
 http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
-  let sid = cookieId(req);
+  if (url.startsWith('/v1/')) return api(req, res, url).catch(e => apiErr(res, 500, 'internal', String(e.message || e)));
+
+  let sid = authOf(req)?.id;
   const s = sid && sessions.get(sid);
   if (s) s.touch();
 
-  if (url === '/') {
+  if (url === '/' || url === '/docs') {
     if (!sid) {
+      if (!ipAllowed(clientIp(req))) { res.writeHead(429, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('Demasiados accesos nuevos desde esta red hoy. Probá mañana.'); }
       sid = crypto.randomBytes(16).toString('hex');
       const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
       res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${KEEP ? 2592000 : 86400}${secure}`);
     }
+    getAccount(sid);
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    return res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
+    return res.end(fs.readFileSync(path.join(__dirname, 'public', url === '/' ? 'index.html' : 'docs.html')));
   }
 
   if (url === '/connect' && req.method === 'POST') {
     if (!sid) { res.writeHead(400); return res.end('sin cookie'); }
-    if (!s) {
-      if (sessions.size >= MAX_SESSIONS) { res.writeHead(503); return res.end('Servidor ocupado'); }
-      const ns = new Session(sid); sessions.set(sid, ns);
-      ns.start().catch(() => ns.close(!KEEP));
-    }
+    getAccount(sid);
+    if (!openSession(sid)) { res.writeHead(503); return res.end('Servidor ocupado'); }
     res.writeHead(200); return res.end('ok');
   }
 
@@ -224,24 +377,19 @@ http.createServer(async (req, res) => {
 
   if (url === '/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ exists: true, ...s.pub() }));
+    return res.end(JSON.stringify({ exists: true, ...s.pub(), quota: accPub(getAccount(s.id), s.id) }));
   }
   if (url === '/events') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
     s.clients.add(res);
-    res.write(`data: ${JSON.stringify(s.pub())}\n\n`);
+    res.write(`data: ${JSON.stringify({ ...s.pub(), quota: accPub(getAccount(s.id), s.id) })}\n\n`);
     const ka = setInterval(() => res.write(': ka\n\n'), 20000);
     return req.on('close', () => { clearInterval(ka); s.clients.delete(res); });
   }
   if (url === '/start' && req.method === 'POST') {
-    if (s.state !== 'connected' || s.running) { res.writeHead(409); return res.end('no listo'); }
-    let nums;
-    try { nums = [...new Set(JSON.parse(await body(req)).numbers.map(String))].filter(n => /^\d{8,15}$/.test(n)); }
-    catch { res.writeHead(400); return res.end('json inválido'); }
-    if (!nums.length) { res.writeHead(400); return res.end('Ningún número válido: deben tener entre 8 y 15 dígitos, con código de país (ej. 5491122334455).'); }
-    if (nums.length > MAX_NUMBERS) { res.writeHead(413); return res.end(`Máximo ${MAX_NUMBERS} números por corrida`); }
-    s.run(nums);
-    res.writeHead(200); return res.end('ok');
+    const out = launch(s, await body(req));
+    res.writeHead(out.status === 202 ? 200 : out.status, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(out.status === 202 ? 'ok' : out.message);
   }
   if (url === '/stop' && req.method === 'POST') { s.stop = true; s.push(); res.writeHead(200); return res.end('ok'); }
   if (url === '/logout' && req.method === 'POST') { await s.close(true); res.writeHead(200); return res.end('ok'); }
@@ -249,32 +397,16 @@ http.createServer(async (req, res) => {
     try { const png = await s.page.screenshot(); res.writeHead(200, { 'Content-Type': 'image/png' }); return res.end(png); }
     catch { res.writeHead(500); return res.end('sin página'); }
   }
-  if (url === '/debug-check' && process.env.DEBUG_SCREENSHOT === '1') { // solo diagnóstico: un número, panel queda abierto
-    try {
-      const n = (new URL(req.url, 'http://x').searchParams.get('n') || '').replace(/\D/g, '');
-      const t0 = Date.now(); const r = await s.check(n);
-      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ...r, ms: Date.now() - t0 }, null, 1));
-    } catch (e) { res.writeHead(500); return res.end(String(e)); }
-  }
-  if (url === '/debug-dom' && process.env.DEBUG_SCREENSHOT === '1') { // solo diagnóstico: describe los campos de texto
-    try {
-      const info = await s.page.evaluate(() => [...document.querySelectorAll('input, [contenteditable], [role="textbox"], [role="searchbox"]')].map(e => ({
-        tag: e.tagName, type: e.type || null, role: e.getAttribute('role'), ce: e.getAttribute('contenteditable'),
-        aria: e.getAttribute('aria-label'), ph: e.getAttribute('placeholder'), title: e.getAttribute('title'),
-        visible: !!(e.offsetWidth || e.offsetHeight), focused: document.activeElement === e, text: (e.innerText || e.value || '').slice(0, 40) })));
-      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(info, null, 1));
-    } catch (e) { res.writeHead(500); return res.end(String(e)); }
-  }
   if (url === '/results.csv') {
     res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="resultados.csv"' });
     return res.end(s.csv());
   }
-  if (url === '/results-debug.csv') { // incluye el texto crudo que leyó WhatsApp, para calibrar
+  if (url === '/results-debug.csv' && process.env.DEBUG_SCREENSHOT === '1') { // incluye el texto crudo que leyó WhatsApp
     res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8' });
     return res.end('phone,status,raw\n' + s.rows.map(r => `${r.phone},${r.status},"${r.raw.replace(/"/g, '""')}"`).join('\n'));
   }
   res.writeHead(404); res.end();
-}).listen(PORT, '0.0.0.0', () => console.log(`Escuchando en :${PORT} (máx ${MAX_SESSIONS} sesiones, headless=${HEADLESS})`));
+}).listen(PORT, '0.0.0.0', () => console.log(`Escuchando en :${PORT} (máx ${MAX_SESSIONS} sesiones, plan gratis ${FREE_LIMIT}, headless=${HEADLESS})`));
 
 const shutdown = async () => { await Promise.all([...sessions.values()].map(s => s.close(!KEEP))); process.exit(0); };
 process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
