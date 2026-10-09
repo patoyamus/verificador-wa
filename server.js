@@ -33,7 +33,8 @@ class Session {
   touch() { this.touched = Date.now(); }
   pub() {
     return {
-      state: this.state, qr: this.qr, running: this.running, total: this.total, done: this.rows.length,
+      state: this.state, qr: this.qr, running: this.running, stopping: this.running && this.stop,
+      total: this.total, done: this.rows.length,
       yes: this.rows.filter(r => r.status === 'yes').length,
       no: this.rows.filter(r => r.status === 'no').length,
       last: this.rows.slice(-12).reverse(),
@@ -66,14 +67,21 @@ class Session {
     }
   }
 
+  // Espera en tramos cortos para poder frenar en cualquier momento
+  async wait(ms) { for (let t = 0; t < ms && !this.stop; t += 200) await sleep(200); }
+  halt() { if (this.stop) throw new Error('stopped'); }
+
   async check(num) {
     const { page } = this;
+    this.halt();
     await this.nuevoChat().click();
     const caja = page.locator('[contenteditable="true"][role="textbox"]').first();
     await caja.waitFor({ timeout: 8000 });
+    this.halt();
     await caja.click();
     await page.keyboard.type(num, { delay: DELAY_TECLA });
-    await sleep(ESPERA_RESULTADO);
+    await this.wait(ESPERA_RESULTADO);
+    this.halt();
     const texto = await caja.evaluate(el => {
       let n = el;
       for (let i = 0; i < 8 && n.parentElement; i++) {
@@ -96,11 +104,12 @@ class Session {
       if (this.stop || this.closed) break;
       try { this.rows.push(await this.check(n)); }
       catch (e) {
+        try { await this.page.keyboard.press('Control+A'); await this.page.keyboard.press('Backspace'); await this.page.keyboard.press('Escape'); } catch {}
+        if (e.message === 'stopped') break; // el número interrumpido no se cuenta
         this.rows.push({ phone: n, status: 'no', raw: 'error: ' + e.message.split('\n')[0] });
-        try { await this.page.keyboard.press('Escape'); } catch {}
       }
       this.touch(); this.push();
-      await sleep(1200 + Math.random() * 1500);
+      await this.wait(1200 + Math.random() * 1500);
     }
     this.running = false; this.touch(); this.push();
   }
@@ -181,7 +190,7 @@ http.createServer(async (req, res) => {
     s.run(nums);
     res.writeHead(200); return res.end('ok');
   }
-  if (url === '/stop' && req.method === 'POST') { s.stop = true; res.writeHead(200); return res.end('ok'); }
+  if (url === '/stop' && req.method === 'POST') { s.stop = true; s.push(); res.writeHead(200); return res.end('ok'); }
   if (url === '/logout' && req.method === 'POST') { await s.close(); res.writeHead(200); return res.end('ok'); }
   if (url === '/results.csv') {
     res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="resultados.csv"' });

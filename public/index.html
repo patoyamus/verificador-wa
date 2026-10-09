@@ -127,7 +127,10 @@ $('run').onclick = async () => {
   }
   started = true; show(5);
 };
-$('stop').onclick = () => fetch('/stop', { method: 'POST' });
+$('stop').onclick = () => {
+  $('stop').disabled = true; $('stop').textContent = 'Deteniendo…'; $('t5').textContent = 'Deteniendo…';
+  fetch('/stop', { method: 'POST' });
+};
 
 function listen() {
 const es = new EventSource('/events');
@@ -145,7 +148,7 @@ es.onmessage = e => {
     $('yes').textContent = s.yes; $('no').textContent = s.no;
     $('bar').style.width = (s.total ? s.done / s.total * 100 : 0) + '%';
     $('tb').innerHTML = s.last.map(r => `<tr><td>${r.phone}</td><td class="${r.status === 'yes' ? 'ok' : 'ko'}">${r.status}</td></tr>`).join('');
-    if (!s.running && s.done > 0) { $('t5').textContent = 'Listo'; $('dl').classList.remove('hide'); $('stop').classList.add('hide'); $('out').classList.remove('hide'); }
+    if (!s.running && s.total > 0) { $('t5').textContent = 'Listo'; $('dl').classList.remove('hide'); $('stop').classList.add('hide'); $('out').classList.remove('hide'); }
   }
 };
 }
