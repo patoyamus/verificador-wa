@@ -13,6 +13,9 @@ const HEADLESS = process.env.HEADLESS !== '0';
 const MAX_SESSIONS = +process.env.MAX_SESSIONS || 3;      // cada una ~400 MB de RAM
 const MAX_NUMBERS = +process.env.MAX_NUMBERS || 200;      // por corrida
 const IDLE_MS = (+process.env.IDLE_MIN || 10) * 60 * 1000;
+// KEEP_SESSION=1 (modo testing): el perfil con las credenciales de WhatsApp se guarda en disco y
+// solo se borra con el botón "Cerrar sesión y borrar datos". Montá SESSIONS_DIR en un volumen.
+const KEEP = process.env.KEEP_SESSION === '1';
 const BASE_DIR = process.env.SESSIONS_DIR || path.join(os.tmpdir(), 'wa-sessions');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const DELAY_TECLA = +process.env.TYPE_DELAY_MS || 70;     // ms entre dígitos
@@ -137,22 +140,22 @@ class Session {
 
   csv() { return 'phone,status\n' + this.rows.map(r => `${r.phone},${r.status}`).join('\n'); }
 
-  async close() {
+  async close(wipe = true) { // wipe=false: cierra el navegador pero conserva el perfil
     if (this.closed) return;
     this.closed = true; this.stop = true;
     this.clients.forEach(c => c.end()); this.clients.clear();
     try { await this.ctx?.close(); } catch {}
-    try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch {}
+    if (wipe) { try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch {} }
     sessions.delete(this.id);
   }
 }
 
 // Limpieza de sesiones inactivas (y de carpetas huérfanas de una corrida anterior)
-fs.rmSync(BASE_DIR, { recursive: true, force: true });
+if (!KEEP) fs.rmSync(BASE_DIR, { recursive: true, force: true });
 fs.mkdirSync(BASE_DIR, { recursive: true });
 setInterval(() => {
   for (const s of sessions.values()) {
-    if (!s.running && Date.now() - s.touched > IDLE_MS) s.close();
+    if (!s.running && Date.now() - s.touched > IDLE_MS) s.close(!KEEP); // en modo KEEP libera la RAM pero conserva las credenciales
   }
 }, 30000);
 
@@ -169,7 +172,7 @@ http.createServer(async (req, res) => {
     if (!sid) {
       sid = crypto.randomBytes(16).toString('hex');
       const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
-      res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400${secure}`);
+      res.setHeader('Set-Cookie', `sid=${sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${KEEP ? 2592000 : 86400}${secure}`);
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
@@ -180,7 +183,7 @@ http.createServer(async (req, res) => {
     if (!s) {
       if (sessions.size >= MAX_SESSIONS) { res.writeHead(503); return res.end('Servidor ocupado'); }
       const ns = new Session(sid); sessions.set(sid, ns);
-      ns.start().catch(() => ns.close());
+      ns.start().catch(() => ns.close(!KEEP));
     }
     res.writeHead(200); return res.end('ok');
   }
@@ -212,7 +215,7 @@ http.createServer(async (req, res) => {
     res.writeHead(200); return res.end('ok');
   }
   if (url === '/stop' && req.method === 'POST') { s.stop = true; s.push(); res.writeHead(200); return res.end('ok'); }
-  if (url === '/logout' && req.method === 'POST') { await s.close(); res.writeHead(200); return res.end('ok'); }
+  if (url === '/logout' && req.method === 'POST') { await s.close(true); res.writeHead(200); return res.end('ok'); }
   if (url === '/results.csv') {
     res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="resultados.csv"' });
     return res.end(s.csv());
@@ -224,5 +227,5 @@ http.createServer(async (req, res) => {
   res.writeHead(404); res.end();
 }).listen(PORT, '0.0.0.0', () => console.log(`Escuchando en :${PORT} (máx ${MAX_SESSIONS} sesiones, headless=${HEADLESS})`));
 
-const shutdown = async () => { await Promise.all([...sessions.values()].map(s => s.close())); process.exit(0); };
+const shutdown = async () => { await Promise.all([...sessions.values()].map(s => s.close(!KEEP))); process.exit(0); };
 process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
