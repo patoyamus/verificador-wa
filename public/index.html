@@ -114,8 +114,14 @@ $('drop').ondragleave = () => $('drop').classList.remove('on');
 $('drop').ondrop = e => { e.preventDefault(); $('file').files = e.dataTransfer.files; $('file').onchange({ target: $('file') }); };
 
 $('run').onclick = async () => {
+  const r = await fetch('/start', { method: 'POST', body: JSON.stringify({ numbers }) });
+  if (!r.ok) {
+    const msg = r.status === 404 ? 'La sesión expiró por inactividad. Recargá la página y volvé a conectar.'
+      : r.status === 409 ? 'WhatsApp todavía no terminó de cargar. Esperá unos segundos y probá de nuevo.'
+      : (await r.text()) || 'No se pudo iniciar la verificación.';
+    $('info').textContent = msg; return;
+  }
   started = true; show(5);
-  await fetch('/start', { method: 'POST', body: JSON.stringify({ numbers }) });
 };
 $('stop').onclick = () => fetch('/stop', { method: 'POST' });
 
