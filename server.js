@@ -57,6 +57,89 @@ const accPub = (a, id, withKey) => ({
 // Textos con los que WhatsApp indica que el número no existe / no hay resultados
 const NEG = /not on whatsapp|isn.t on whatsapp|no est[aá] en whatsapp|no results|no se encontr|sin resultados|invalid|inv[aá]lid|not found/i;
 
+// --- Normalización de números ---------------------------------------------------------
+const { parsePhoneNumberFromString, getCountries, getCountryCallingCode } = require('libphonenumber-js/max');
+const REGION_NAMES = new Intl.DisplayNames(['es'], { type: 'region' });
+const flagOf = c => String.fromCodePoint(...[...c].map(ch => 0x1F1E6 + ch.charCodeAt(0) - 65));
+const parseSafe = (v, c) => { try { return parsePhoneNumberFromString(v, c); } catch { return null; } };
+
+function countriesList() {
+  return getCountries().map(c => ({ code: c, name: REGION_NAMES.of(c), calling: getCountryCallingCode(c), flag: flagOf(c) }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'es'));
+}
+
+// Del número que escaneó el QR: país, código de área (AR/BR) y un ejemplo del formato esperado.
+function analyzeOwn(digits) {
+  const pn = parseSafe('+' + digits);
+  if (!pn) return { number: digits, country: null };
+  const nat = pn.formatNational();
+  let area = null;
+  if (pn.country === 'AR') area = (/^0(\d{2,4})\s/.exec(nat) || [])[1] || null;       // 011 15-3063-3222 → 11
+  if (pn.country === 'BR') area = (/^\(?(\d{2})\)?\s/.exec(nat) || [])[1] || null;     // (11) 98765-4321 → 11
+  const local = pn.formatInternational().replace(/^\+\d+\s*/, '');                   // 9 11 3063 3222
+  const sample = '12345678', arr = [...local];
+  let k = Math.min(8, Math.max(4, String(pn.nationalNumber).length - 3)), i = 0;
+  for (let j = arr.length - 1; j >= 0 && i < k; j--) if (/\d/.test(arr[j])) { arr[j] = sample[sample.length - 1 - i]; i++; }
+  return {
+    number: digits, international: pn.formatInternational(), country: pn.country || null,
+    calling: pn.countryCallingCode, area, example: arr.join('').replace(/(\d{3,4}) (\d{4})$/, '$1-$2'),
+    countryName: pn.country ? REGION_NAMES.of(pn.country) : null,
+  };
+}
+
+// Deja el número como lo usa WhatsApp (solo dígitos, con código de país; en AR con el 9 de celular).
+function normalizePhone(raw, country, ref) {
+  const input = String(raw ?? '').trim();
+  let s = input.replace(/[^\d+]/g, '');
+  if (/^00\d/.test(s)) s = '+' + s.slice(2);
+  if (!/\d/.test(s)) return { input, valid: false, reason: 'vacío' };
+  if (/^\d+[.,]\d+e\+?\d+$/i.test(input)) return { input, valid: false, reason: 'notación científica de Excel: formateá la columna como texto' };
+  const notes = [];
+  const cc = country ? String(getCountryCallingCode(country)) : null;
+  let pn = null;
+  if (s.startsWith('+')) pn = parseSafe(s);
+  else {
+    if (cc && s.startsWith(cc) && s.length > cc.length + 6) pn = parseSafe('+' + s);
+    if (!pn || !pn.isValid()) pn = parseSafe(s, country || undefined);
+  }
+  // AR/BR: completar el código de área faltante con el del número de referencia
+  if ((!pn || !pn.isValid()) && ref && ref.area && country === ref.country) {
+    let local = s.replace(/^\+/, '');
+    if (cc && local.startsWith(cc)) local = local.slice(cc.length);
+    local = local.replace(/^0+/, '').replace(/^15(?=\d{8}$)/, '');
+    if (/^\d{8,9}$/.test(local) && country === 'AR') {
+      const cand = parseSafe('+549' + ref.area + local);
+      if (cand && cand.isValid()) { pn = cand; notes.push(`se agregó el código de área ${ref.area} de tu número`); }
+    }
+  }
+  if (!pn || !pn.isValid()) return { input, valid: false, reason: 'formato inválido' };
+  // AR: los celulares en WhatsApp llevan 9 después del 54; un número sin él se toma como celular
+  if (pn.country === 'AR' && String(pn.nationalNumber).length === 10 && !/^9/.test(pn.nationalNumber)) {
+    const cand = parseSafe('+549' + pn.nationalNumber);
+    if (cand && cand.isValid()) { pn = cand; notes.push('se agregó el 9 de celular'); }
+  }
+  const phone = pn.number.slice(1);
+  const changed = phone !== input.replace(/\D/g, '');
+  if (changed && !notes.length) notes.push('formato normalizado');
+  return { input, phone, valid: true, changed, note: notes.join(', ') || null, country: pn.country || null };
+}
+
+// Normaliza una lista: {numbers (únicos y válidos), inputs (phone→original), changed, invalid, duplicates, examples}
+function normalizeList(list, country, ref, doNormalize = true) {
+  const numbers = [], inputs = new Map(), invalid = [], examples = [];
+  let changed = 0, duplicates = 0;
+  for (const raw of list) {
+    let r;
+    if (doNormalize) r = normalizePhone(raw, country, ref);
+    else { const d = String(raw ?? '').replace(/\D/g, ''); r = /^\d{8,15}$/.test(d) ? { input: String(raw), phone: d, valid: true, changed: false } : { input: String(raw), valid: false, reason: 'debe tener 8 a 15 dígitos' }; }
+    if (!r.valid) { invalid.push({ input: r.input, reason: r.reason }); continue; }
+    if (inputs.has(r.phone)) { duplicates++; continue; }
+    inputs.set(r.phone, r.input); numbers.push(r.phone);
+    if (r.changed) { changed++; if (examples.length < 8) examples.push({ input: r.input, phone: r.phone, note: r.note }); }
+  }
+  return { numbers, inputs, changed, invalid, duplicates, examples };
+}
+
 const sessions = new Map();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -70,6 +153,8 @@ class Session {
   pub() {
     return {
       state: this.state, qr: this.qr, running: this.running, stopping: this.running && this.stop, error: this.error || null,
+      me: this.me || null,
+      syncSeconds: this.syncUntil ? Math.max(0, Math.ceil((this.syncUntil - Date.now()) / 1000)) : 0,
       total: this.total, done: this.rows.length,
       yes: this.rows.filter(r => r.status === 'yes').length,
       no: this.rows.filter(r => r.status === 'no').length,
@@ -94,8 +179,12 @@ class Session {
         if (await this.nuevoChat().isVisible()) {
           if (this.state !== 'connected') {
             // recién vinculado: WhatsApp sigue sincronizando y las búsquedas pueden dar falsos "no"
-            if (this.state === 'qr') this.syncUntil = Date.now() + SYNC_MS;
+            if (this.state === 'qr') { this.syncUntil = Date.now() + SYNC_MS; setTimeout(() => this.push(), SYNC_MS + 300); }
             this.state = 'connected'; this.qr = null; this.push();
+          }
+          if (!this.me) { // número de la cuenta vinculada, para sugerir país y formato
+            const d = await this.readOwn();
+            if (d) { this.me = analyzeOwn(d); this.push(); }
           }
         } else {
           const canvas = this.page.locator('canvas').first();
@@ -107,6 +196,15 @@ class Session {
       } catch { /* página navegando */ }
       await sleep(1500);
     }
+  }
+
+  // WhatsApp Web guarda el id de la cuenta vinculada en localStorage ("5491130633222:23@c.us")
+  async readOwn() {
+    try {
+      const raw = await this.page.evaluate(() => localStorage.getItem('last-wid-md') || localStorage.getItem('last-wid') || '');
+      const m = /(\d{8,15})(?::\d+)?@/.exec(raw);
+      return m ? m[1] : null;
+    } catch { return null; }
   }
 
   // Espera en tramos cortos para poder frenar en cualquier momento
@@ -187,7 +285,7 @@ class Session {
     return { phone: num, status, raw: `[${r.waited}ms] ` + t };
   }
 
-  async run(numbers, truncated = false) {
+  async run(numbers, truncated = false, inputs = new Map()) {
     const acc = getAccount(this.id);
     this.running = true; this.stop = false; this.error = null; this.rows = [];
     const job = { id: 'job_' + crypto.randomBytes(6).toString('hex'), status: 'running', total: numbers.length,
@@ -199,7 +297,9 @@ class Session {
       if (this.stop || this.closed) break;
       if (acc.used >= acc.limit) { this.error = `Agotaste las ${acc.limit} verificaciones gratis.`; break; }
       try {
-        const row = await this.check(n);
+        let row = await this.check(n);
+        if (row.status === 'error') { await this.wait(700); row = await this.check(n); } // un reintento antes de rendirse
+        row.input = inputs.get(n);
         this.rows.push(row);
         if (row.status === 'error') { // respuesta indeterminada: no descuenta cupo y cuenta como fallo
           if (++fallos >= 3) { this.error = 'WhatsApp no devolvió resultados claros (3 seguidos). Probá de nuevo en unos minutos.'; break; }
@@ -210,7 +310,7 @@ class Session {
         if (e.message === 'stopped') break; // el número interrumpido no se cuenta
         // un error no es un "no": queda aparte y no descuenta del cupo
         const motivo = e.message.split('\n')[0];
-        this.rows.push({ phone: n, status: 'error', raw: 'error: ' + motivo });
+        this.rows.push({ phone: n, input: inputs.get(n), status: 'error', raw: 'error: ' + motivo });
         if (++fallos >= 3) { this.error = 'No pude operar WhatsApp Web (3 fallos seguidos): ' + motivo; break; }
       }
       this.touch(); this.push();
@@ -227,11 +327,11 @@ class Session {
       id: job.id, status: job.status, total: job.total, done: rows.length, truncated: job.truncated,
       yes: rows.filter(r => r.status === 'yes').length, no: rows.filter(r => r.status === 'no').length,
       errors: rows.filter(r => r.status === 'error').length, error: job.error, created: job.created,
-      ...(full ? { results: rows.map(r => ({ phone: r.phone, status: r.status })) } : {}),
+      ...(full ? { results: rows.map(r => ({ phone: r.phone, ...(r.input && r.input.replace(/\D/g, '') !== r.phone ? { input: r.input } : {}), status: r.status, ...(r.status === 'error' ? { detail: String(r.raw || '').slice(0, 160) } : {}) })) } : {}),
     };
   }
 
-  csv() { return 'phone,status\n' + this.rows.map(r => `${r.phone},${r.status}`).join('\n'); }
+  csv() { return 'phone,status,input\n' + this.rows.map(r => `${r.phone},${r.status},"${String(r.input ?? r.phone).replace(/"/g, '""')}"`).join('\n'); }
 
   async close(wipe = true) { // wipe=false: cierra el navegador pero conserva el perfil
     if (this.closed) return;
@@ -280,21 +380,27 @@ function launch(s, rawBody) {
     const seg = Math.ceil((s.syncUntil - Date.now()) / 1000);
     return { status: 409, code: 'session_syncing', message: `WhatsApp está sincronizando tu cuenta. Esperá ${seg} segundos y probá de nuevo.` };
   }
-  let nums;
+  let list, opts;
   try {
-    const list = JSON.parse(rawBody).numbers;
+    opts = JSON.parse(rawBody);
+    list = opts.numbers;
     if (!Array.isArray(list)) throw new Error('numbers');
-    nums = [...new Set(list.map(n => String(n).replace(/\D/g, '')))].filter(n => /^\d{8,15}$/.test(n));
   } catch { return { status: 400, code: 'invalid_body', message: 'Enviá JSON con {"numbers": ["5491122334455", …]}.' }; }
-  if (!nums.length) return { status: 400, code: 'no_valid_numbers', message: 'Ningún número válido: deben tener entre 8 y 15 dígitos, con código de país (ej. 5491122334455).' };
+  if (list.length > MAX_NUMBERS * 5) return { status: 413, code: 'too_many_numbers', message: `Máximo ${MAX_NUMBERS} números por pedido.` };
+  // País de referencia: el indicado, o el del número que escaneó el QR. Normaliza salvo "normalize": false.
+  const country = String(opts.country || (s.me && s.me.country) || '').toUpperCase() || null;
+  const norm = normalizeList(list, country, s.me, opts.normalize !== false);
+  let nums = norm.numbers;
+  const normInfo = { country, changed: norm.changed, duplicates: norm.duplicates, invalid: norm.invalid.slice(0, 50), invalid_count: norm.invalid.length, examples: norm.examples };
+  if (!nums.length) return { status: 400, code: 'no_valid_numbers', message: 'Ningún número válido: deben tener código de país y un formato correcto (ej. 5491122334455).', normalization: normInfo };
   if (nums.length > MAX_NUMBERS) return { status: 413, code: 'too_many_numbers', message: `Máximo ${MAX_NUMBERS} números por pedido.` };
   const acc = getAccount(s.id);
   const left = Math.max(0, acc.limit - acc.used);
   if (left === 0) return { status: 402, code: 'quota_exceeded', message: `Usaste tus ${acc.limit} verificaciones gratis.`, quota: accPub(acc, s.id) };
   const truncated = nums.length > left;
   if (truncated) nums = nums.slice(0, left);
-  s.run(nums, truncated);
-  return { status: 202, id: s.job.id, total: nums.length, truncated, quota: accPub(acc, s.id) };
+  s.run(nums, truncated, norm.inputs);
+  return { status: 202, id: s.job.id, total: nums.length, truncated, quota: accPub(acc, s.id), normalization: normInfo };
 }
 
 function openSession(id) {
@@ -312,6 +418,8 @@ async function api(req, res, url) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
+  if (url === '/v1/countries' && req.method === 'GET') return sendJson(res, 200, { countries: countriesList() });
+
   if (url === '/v1/keys' && req.method === 'POST') { // alta de cuenta gratis
     if (!ipAllowed(clientIp(req))) return apiErr(res, 429, 'rate_limited', 'Demasiadas cuentas nuevas desde esta red hoy. Probá mañana.');
     const id = crypto.randomBytes(16).toString('hex');
@@ -326,6 +434,21 @@ async function api(req, res, url) {
   if (s) s.touch();
 
   if (url === '/v1/account' && req.method === 'GET') return sendJson(res, 200, accPub(acc, a.id, !a.viaKey));
+
+  // Vista previa de la normalización: no gasta cupo ni necesita sesión conectada
+  if (url === '/v1/normalize' && req.method === 'POST') {
+    let b;
+    try { b = JSON.parse(await body(req)); if (!Array.isArray(b.numbers)) throw 0; }
+    catch { return apiErr(res, 400, 'invalid_body', 'Enviá JSON con {"numbers": [...], "country": "AR"}.'); }
+    const country = String(b.country || (s && s.me && s.me.country) || '').toUpperCase() || null;
+    if (!country) return apiErr(res, 400, 'country_required', 'Indicá "country" (ej. "AR") o conectá WhatsApp para tomarlo de tu número.');
+    const n = normalizeList(b.numbers.slice(0, 5000), country, s && s.me);
+    return sendJson(res, 200, {
+      country, reference: s && s.me ? { number: s.me.number, international: s.me.international, example: s.me.example } : null,
+      summary: { total: b.numbers.length, valid: n.numbers.length, changed: n.changed, invalid: n.invalid.length, duplicates: n.duplicates },
+      examples: n.examples, invalid: n.invalid.slice(0, 50),
+    });
+  }
 
   if (url === '/v1/session') {
     if (req.method === 'POST') {
@@ -344,7 +467,7 @@ async function api(req, res, url) {
     if (!s) return apiErr(res, 409, 'no_session', 'Primero creá la sesión (POST /v1/session) y escaneá el QR.');
     const out = launch(s, await body(req));
     if (out.status !== 202) return apiErr(res, out.status, out.code, out.message, out.quota ? { quota: out.quota } : {});
-    return sendJson(res, 202, { id: out.id, status: 'running', total: out.total, truncated: out.truncated, quota: out.quota });
+    return sendJson(res, 202, { id: out.id, status: 'running', total: out.total, truncated: out.truncated, quota: out.quota, normalization: out.normalization });
   }
 
   const m = /^\/v1\/checks\/(job_[a-f0-9]+)(\.csv)?$/.exec(url);
@@ -353,7 +476,7 @@ async function api(req, res, url) {
     if (!job) return apiErr(res, 404, 'job_not_found', 'No existe ese pedido (o la sesión ya se cerró).');
     if (m[2]) {
       res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${job.id}.csv"` });
-      return res.end('phone,status\n' + job.rows.map(r => `${r.phone},${r.status}`).join('\n'));
+      return res.end('phone,status,input\n' + job.rows.map(r => `${r.phone},${r.status},"${String(r.input ?? r.phone).replace(/"/g, '""')}"`).join('\n'));
     }
     return sendJson(res, 200, s.jobPub(job));
   }

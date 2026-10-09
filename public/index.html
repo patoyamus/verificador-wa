@@ -27,6 +27,15 @@ td{padding:6px 4px;border-top:1px solid var(--bd)}
 .row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:16px}
 .plan{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px;color:var(--mut);margin:-12px -12px 20px;padding:10px 14px;border:1px solid var(--bd);border-radius:10px;text-align:left}
 .plan a{color:var(--g);font-weight:600;text-decoration:none}.plan b{color:var(--tx)}
+.fmt{text-align:left;border:1px solid var(--bd);border-radius:12px;padding:16px;margin:8px 0 20px}
+.lbl{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;margin:10px 0 4px}.lbl:first-child{margin-top:0}
+.mono{font:600 15px ui-monospace,Consolas,monospace}.mono.big{font-size:20px}
+.fmtrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+select{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:10px;font:15px system-ui;max-width:100%}
+.warn{font-size:13px;margin:14px 0 0;color:#b7791f}
+button:disabled{opacity:.5;cursor:not-allowed}
+.norm{font-size:13px;text-align:left;border:1px solid var(--bd);border-radius:10px;padding:10px 12px}
+.norm code{background:var(--bg);padding:1px 5px;border-radius:4px}
 .spin{width:36px;height:36px;border:4px solid var(--bd);border-top-color:var(--g);border-radius:50%;animation:s 1s linear infinite;margin:16px auto}
 @keyframes s{to{transform:rotate(360deg)}}
 </style></head><body>
@@ -54,8 +63,18 @@ td{padding:6px 4px;border-top:1px solid var(--bd)}
 
   <section id="s3" class="hide">
     <h1 style="color:var(--g)">✔ ¡Conexión OK!</h1>
-    <p>Sesión de WhatsApp Web activa.</p>
-    <button id="next">Continuar</button>
+    <p id="syncmsg">Sincronizando WhatsApp… <b id="syncsec"></b></p>
+    <div class="fmt">
+      <div class="lbl">Tu número (detectado de tu WhatsApp)</div>
+      <div class="mono big" id="me">Detectando…</div>
+      <div class="lbl">País de los números a verificar</div>
+      <div class="fmtrow">
+        <select id="country" aria-label="Código de país"></select>
+        <div class="mono" id="fmtex">—</div>
+      </div>
+      <p class="warn" id="fmtwarn">⚠ Tus números deberían estar en este formato. Los que no lo estén los normalizamos tomando tu número como referencia.</p>
+    </div>
+    <button id="next" disabled>Continuar</button>
   </section>
 
   <section id="s4" class="hide">
@@ -109,7 +128,44 @@ $('go').onclick = async () => {
 $('out').onclick = async () => { await fetch('/logout', { method: 'POST' }); location.reload(); };
 $('next').onclick = () => show(4);
 
-function parse(t) {
+// --- País, formato y normalización -------------------------------------------------------
+let me = null, countries = [], country = null;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+fetch('/v1/countries').then(r => r.json()).then(d => {
+  countries = d.countries;
+  $('country').innerHTML = countries.map(c => `<option value="${c.code}">${c.flag} +${c.calling} ${esc(c.name)}</option>`).join('');
+  if (country) $('country').value = country;
+}).catch(() => {});
+
+function renderFmt() {
+  const c = countries.find(x => x.code === country);
+  if (me && me.country === country) {
+    $('fmtex').textContent = '+' + me.calling + '  ' + me.example;
+    $('fmtwarn').textContent = '⚠ Tus números deberían estar en este formato (ej. ' + me.example + '). Los que no lo estén los normalizamos tomando tu número como referencia.';
+  } else if (c) {
+    $('fmtex').textContent = '+' + c.calling + '  …';
+    $('fmtwarn').textContent = '⚠ Usá el código de país +' + c.calling + ' seguido del número completo. El país es distinto al de tu WhatsApp: no podemos completar el código de área por vos.';
+  }
+}
+
+function renderMe(s) {
+  if (s.me && s.me.number) {
+    me = s.me;
+    $('me').textContent = me.international || ('+' + me.number);
+    if (!country && me.country) { country = me.country; if (countries.length) $('country').value = country; }
+  }
+  renderFmt();
+  const secs = s.syncSeconds || 0;
+  $('syncmsg').classList.toggle('hide', secs === 0);
+  $('syncsec').textContent = secs ? '(' + secs + ' s)' : '';
+  $('next').disabled = secs > 0 || !country;
+  clearTimeout(renderMe.t);
+  if (secs > 0) renderMe.t = setTimeout(() => renderMe({ ...s, syncSeconds: secs - 1 }), 1000);
+}
+$('country').onchange = () => { country = $('country').value; renderFmt(); };
+
+function parse(t) { // devuelve las celdas de teléfono tal cual vienen; la normalización la hace el servidor
   const L = t.split(/\r?\n/).filter(x => x.trim());
   if (!L.length) return [];
   const sp = l => l.split(/[,;\t]/).map(c => c.trim().replace(/^"|"$/g, ''));
@@ -118,25 +174,36 @@ function parse(t) {
     const i = sp(L[0]).findIndex(c => /phone|tel|cel|numero|número|number|whats/i.test(c));
     col = i >= 0 ? i : 0; rows = L.slice(1);
   }
-  parse.ignored = 0;
-  return rows.map(l => (sp(l)[col] || '').replace(/\D/g, '')).filter(n => {
-    const ok = n.length >= 8 && n.length <= 15; if (!ok) parse.ignored++; return ok;
-  });
+  return rows.map(l => sp(l)[col] || '').filter(x => x.trim());
 }
 
 $('file').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
-  numbers = [...new Set(parse(await f.text()))];
-  const ign = parse.ignored ? ` (${parse.ignored} ignorados: deben tener 8 a 15 dígitos)` : '';
-  $('info').textContent = numbers.length ? numbers.length + ' números válidos detectados' + ign : 'No encontré teléfonos válidos en el archivo' + ign;
-  $('run').classList.toggle('hide', !numbers.length);
+  numbers = parse(await f.text());
+  $('run').classList.add('hide');
+  if (!numbers.length) { $('info').textContent = 'No encontré teléfonos en el archivo'; return; }
+  $('info').textContent = 'Analizando formato…';
+  try {
+    const r = await fetch('/v1/normalize', { method: 'POST', body: JSON.stringify({ numbers, country }) });
+    const d = await r.json();
+    if (!r.ok) { $('info').textContent = d.error ? d.error.message : 'No pude analizar el archivo'; return; }
+    const sm = d.summary;
+    let h = `<b>${sm.valid}</b> números válidos de ${sm.total}`;
+    if (sm.changed) h += ` · <b>${sm.changed}</b> normalizados`;
+    if (sm.duplicates) h += ` · ${sm.duplicates} repetidos`;
+    if (sm.invalid) h += ` · <b style="color:var(--r)">${sm.invalid}</b> inválidos (se omiten)`;
+    if (d.examples.length) h += '<br>' + d.examples.slice(0, 3).map(x => `<code>${esc(x.input)}</code> → <code>${x.phone}</code> <span style="color:var(--mut)">${esc(x.note || '')}</span>`).join('<br>');
+    if (d.invalid.length) h += '<br>Inválidos: ' + d.invalid.slice(0, 3).map(x => `<code>${esc(x.input || '(vacío)')}</code> ${esc(x.reason)}`).join(' · ');
+    $('info').innerHTML = '<div class="norm">' + h + '</div>';
+    $('run').classList.toggle('hide', sm.valid === 0);
+  } catch { $('info').textContent = 'No pude analizar el archivo'; }
 };
 $('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('on'); };
 $('drop').ondragleave = () => $('drop').classList.remove('on');
 $('drop').ondrop = e => { e.preventDefault(); $('file').files = e.dataTransfer.files; $('file').onchange({ target: $('file') }); };
 
 $('run').onclick = async () => {
-  const r = await fetch('/start', { method: 'POST', body: JSON.stringify({ numbers }) });
+  const r = await fetch('/start', { method: 'POST', body: JSON.stringify({ numbers, country }) });
   if (!r.ok) {
     const msg = r.status === 404 ? 'La sesión expiró por inactividad. Recargá la página y volvé a conectar.'
       : r.status === 409 ? 'WhatsApp todavía no terminó de cargar. Esperá unos segundos y probá de nuevo.'
@@ -155,6 +222,7 @@ const es = new EventSource('/events');
 es.onmessage = e => {
   const s = JSON.parse(e.data);
   if (s.quota) showQuota(s.quota);
+  if (s.state === 'connected' && (step === 2 || step === 3)) renderMe(s);
   if (step === 2) {
     if (s.state === 'connected') show(3);
     else if (s.state === 'qr') {
@@ -166,7 +234,7 @@ es.onmessage = e => {
     $('done').textContent = s.done; $('total').textContent = s.total;
     $('yes').textContent = s.yes; $('no').textContent = s.no;
     $('bar').style.width = (s.total ? s.done / s.total * 100 : 0) + '%';
-    $('tb').innerHTML = s.last.map(r => `<tr><td>${r.phone}</td><td class="${r.status === 'yes' ? 'ok' : 'ko'}">${r.status}</td></tr>`).join('');
+    $('tb').innerHTML = s.last.map(r => `<tr><td>${r.phone}${r.input && r.input.replace(/\D/g, '') !== r.phone ? ` <span style="color:var(--mut);font-size:12px">← ${esc(r.input)}</span>` : ''}</td><td class="${r.status === 'yes' ? 'ok' : 'ko'}">${r.status}</td></tr>`).join('');
     if (s.error) { $('t5').textContent = s.error; $('t5').style.fontSize = '16px'; }
     if (!s.running && s.total > 0) { $('t5').textContent = 'Listo'; $('dl').classList.remove('hide'); $('stop').classList.add('hide'); $('out').classList.remove('hide'); }
   }
@@ -177,7 +245,7 @@ es.onmessage = e => {
 fetch('/state').then(r => r.json()).then(s => {
   if (!s.exists) return;
   if (s.running || s.done > 0) { started = true; show(5); }
-  else show(s.state === 'connected' ? 3 : 2);
+  else { show(s.state === 'connected' ? 3 : 2); if (s.state === 'connected') renderMe(s); }
   listen();
 });
 </script></body></html>

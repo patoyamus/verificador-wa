@@ -45,6 +45,23 @@ curl https://TU-DOMINIO/v1/session -H "Authorization: Bearer $KEY"
 { "state": "qr", "qr": "&lt;PNG en base64&gt;", "running": false }</pre>
 <p><code>state</code>: <code>loading</code> → <code>qr</code> → <code>connected</code>. La primera vez el QR tarda unos 20 a 40 segundos. Al vincular, WhatsApp sincroniza ~45 segundos: antes de eso <code>POST /v1/checks</code> responde <code>409 session_syncing</code>. Mostralo como <code>data:image/png;base64,…</code>.</p>
 
+<h2>Formato de los números y normalización</h2>
+<p>Al conectar, <code>GET /v1/session</code> devuelve <code>me</code>: tu número vinculado, su país y un ejemplo de formato. Los números que envíes se <b>normalizan automáticamente</b> tomando ese número como referencia:</p>
+<table>
+<tr><th>Entrada</th><th>Resultado</th><th>Regla</th></tr>
+<tr><td><code>011 15 3063-3222</code></td><td><code>5491130633222</code></td><td>quita el 0 y el 15, agrega +54 9</td></tr>
+<tr><td><code>1130633222</code></td><td><code>5491130633222</code></td><td>agrega país y el 9 de celular (AR)</td></tr>
+<tr><td><code>15 3063 3222</code></td><td><code>5491130633222</code></td><td>completa el código de área con el de tu número</td></tr>
+<tr><td><code>0054 9 11 3063 3222</code></td><td><code>5491130633222</code></td><td>prefijo internacional 00</td></tr>
+<tr><td><code>5.49E+12</code></td><td>inválido</td><td>notación científica de Excel</td></tr>
+</table>
+<p>Podés indicar otro país con <code>"country": "ES"</code> o desactivar la normalización con <code>"normalize": false</code>. <code>GET /v1/countries</code> lista los países y <code>POST /v1/normalize</code> hace una vista previa sin gastar cupo y sin sesión conectada (si pasás <code>country</code>).</p>
+<pre>curl -X POST https://TU-DOMINIO/v1/normalize -H "Authorization: Bearer $KEY"   -d '{"numbers": ["1130633222", "011 15 3063-3222", "hola"], "country": "AR"}'
+
+{ "country": "AR", "summary": { "total": 3, "valid": 1, "changed": 1, "invalid": 1, "duplicates": 1 },
+  "examples": [ { "input": "1130633222", "phone": "5491130633222", "note": "se agregó el 9 de celular" } ],
+  "invalid": [ { "input": "hola", "reason": "vacío" } ] }</pre>
+
 <h2>3 · Verificar números</h2>
 <p><span class="tag">POST</span><code>/v1/checks</code></p>
 <pre>curl -X POST https://TU-DOMINIO/v1/checks \
@@ -53,19 +70,20 @@ curl https://TU-DOMINIO/v1/session -H "Authorization: Bearer $KEY"
 
 { "id": "job_9a1c…", "status": "running", "total": 2, "truncated": false,
   "quota": { "limit": 50, "used": 0, "remaining": 50 } }</pre>
-<p>Los números van con código de país (8 a 15 dígitos). Máximo 200 por pedido. Si pedís más de lo que te queda, se procesan los que alcanzan y <code>truncated</code> es <code>true</code>.</p>
+<p>La respuesta incluye <code>normalization</code> (cuántos se corrigieron, repetidos e inválidos). Máximo 200 por pedido. Si pedís más de lo que te queda, se procesan los que alcanzan y <code>truncated</code> es <code>true</code>.</p>
 
 <h2>4 · Leer el resultado</h2>
 <p><span class="tag">GET</span><code>/v1/checks/{id}</code> &nbsp; <span class="tag">GET</span><code>/v1/checks/{id}.csv</code></p>
 <pre>{ "id": "job_9a1c…", "status": "done", "total": 2, "done": 2,
   "yes": 1, "no": 1, "errors": 0,
   "results": [ { "phone": "5491122334455", "status": "no" },
-               { "phone": "5492994713247", "status": "yes" } ] }</pre>
+               { "phone": "5492994713247", "input": "2994713247", "status": "yes" } ] }</pre>
+<p><code>input</code> aparece cuando el número original se normalizó. El CSV lleva las columnas <code>phone,status,input</code>.</p>
 <table>
 <tr><th>status</th><th>Significado</th></tr>
 <tr><td><code>yes</code></td><td>El número tiene WhatsApp.</td></tr>
 <tr><td><code>no</code></td><td>No se encontró en WhatsApp (o está mal escrito).</td></tr>
-<tr><td><code>error</code></td><td>No se pudo comprobar; no descuenta del cupo.</td></tr>
+<tr><td><code>error</code></td><td>No se pudo comprobar (respuesta indeterminada); no descuenta del cupo. Trae <code>detail</code>.</td></tr>
 </table>
 <p>Estado del pedido: <code>running</code>, <code>done</code>, <code>stopped</code> o <code>error</code>. Se consulta cada 1 o 2 segundos; cada número tarda ~1 s. Los resultados viven mientras la sesión esté abierta.</p>
 
