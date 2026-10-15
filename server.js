@@ -511,7 +511,7 @@ async function api(req, res, url) {
   if (a.viaKey && !accounts[a.id]) return apiErr(res, 401, 'invalid_key', 'API key inválida.');
   if (!SIGNUP_OPEN && !accounts[a.id]) return apiErr(res, 401, 'signup_closed', 'Acceso restringido: usá la API key registrada.');
   const acc = getAccount(a.id);
-  const s = sessions.get(a.id);
+  let s = sessions.get(a.id);
   if (s) s.touch();
 
   if (url === '/v1/account' && req.method === 'GET') return sendJson(res, 200, accPub(acc, a.id, !a.viaKey));
@@ -548,7 +548,12 @@ async function api(req, res, url) {
   // Consulta individual y síncrona, pensada para llamarla justo antes de cada envío (n8n).
   // Un número por llamada; responde con yes / no / error (o invalid si el formato no sirve).
   if (url === '/v1/lookup' && req.method === 'POST') {
-    if (!s) return apiErr(res, 409, 'no_session', 'Primero creá la sesión (POST /v1/session).');
+    if (!s) { // la sesión se cerró por inactividad: se reabre sola con las credenciales guardadas
+      s = openSession(a.id);
+      if (!s) return apiErr(res, 503, 'server_busy', 'El servidor está ocupado.');
+    }
+    for (let t = 0; t < 45000 && !['connected', 'qr', 'unavailable'].includes(s.state); t += 500) await sleep(500);
+    if (s.state === 'qr') return apiErr(res, 409, 'needs_qr', 'La línea se desvinculó: entrá a /login?key=… y escaneá el QR de nuevo.');
     if (s.state !== 'connected') return apiErr(res, 409, 'session_not_ready', 'WhatsApp todavía no está conectado.');
     if (s.syncUntil && Date.now() < s.syncUntil) return apiErr(res, 409, 'session_syncing', 'WhatsApp está sincronizando. Probá en unos segundos.');
     if (s.running) return apiErr(res, 409, 'job_running', 'Hay una verificación por lote en curso.');
