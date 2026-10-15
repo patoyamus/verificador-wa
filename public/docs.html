@@ -72,6 +72,13 @@ curl https://TU-DOMINIO/v1/session -H "Authorization: Bearer $KEY"
   "quota": { "limit": 50, "used": 0, "remaining": 50 } }</pre>
 <p>La respuesta incluye <code>normalization</code> (cuántos se corrigieron, repetidos e inválidos). Máximo 200 por pedido. Si pedís más de lo que te queda, se procesan los que alcanzan y <code>truncated</code> es <code>true</code>.</p>
 
+<h2>Consulta individual (para usar justo antes de cada envío)</h2>
+<p><span class="tag">POST</span><code>/v1/lookup</code> — un número por llamada, responde en ~1 segundo.</p>
+<pre>curl -X POST https://TU-DOMINIO/v1/lookup -H "Authorization: Bearer $KEY"   -d '{"phone": "011 15 3063-3222"}'
+
+{ "phone": "5491130633222", "input": "011 15 3063-3222", "status": "yes", "normalized": true, "note": "formato normalizado" }</pre>
+<p><code>status</code>: <code>yes</code> (tiene WhatsApp), <code>no</code> (no tiene), <code>invalid</code> (formato inválido; no consulta ni descuenta) o <code>error</code> (indeterminado: en ese caso conviene enviar igual y reintentar la verificación después).</p>
+
 <h2>4 · Leer el resultado</h2>
 <p><span class="tag">GET</span><code>/v1/checks/{id}</code> &nbsp; <span class="tag">GET</span><code>/v1/checks/{id}.csv</code></p>
 <pre>{ "id": "job_9a1c…", "status": "done", "total": 2, "done": 2,

@@ -66,6 +66,34 @@ const accPub = (a, id, withKey) => ({
 // Textos con los que WhatsApp indica que el número no existe / no hay resultados
 const NEG = /not on whatsapp|isn.t on whatsapp|no est[aá] en whatsapp|no results|no se encontr|sin resultados|invalid|inv[aá]lid|not found/i;
 
+// --- Modo interno (un solo usuario) ---------------------------------------------------
+// SIGNUP=0 cierra el alta de cuentas: solo funcionan las claves ya registradas.
+// ADMIN_KEY (wak_ + 32 hex) registra tu cuenta al arrancar, con cupo prácticamente ilimitado.
+const SIGNUP_OPEN = process.env.SIGNUP !== '0';
+const ADMIN_LIMIT = +process.env.ADMIN_LIMIT || 1000000000;
+{
+  const m = /^wak_([a-f0-9]{32})$/.exec(process.env.ADMIN_KEY || '');
+  if (m) {
+    if (!accounts[m[1]]) accounts[m[1]] = { created: new Date().toISOString(), plan: 'internal', limit: ADMIN_LIMIT, used: 0 };
+    else accounts[m[1]].limit = Math.max(accounts[m[1]].limit, ADMIN_LIMIT);
+    saveAccounts();
+  }
+}
+// Tope diario de consultas de la línea (0 = sin tope). Se reinicia a medianoche (hora del servidor).
+const DAILY_CAP = +process.env.DAILY_CAP || 0;
+const DAY_FILE = path.join(DATA_DIR, 'daycount.json');
+let day = { date: '', n: 0 };
+try { day = JSON.parse(fs.readFileSync(DAY_FILE, 'utf8')); } catch {}
+function dayLeft() {
+  const today = new Date().toLocaleDateString('en-CA');
+  if (day.date !== today) day = { date: today, n: 0 };
+  return DAILY_CAP > 0 ? Math.max(0, DAILY_CAP - day.n) : Infinity;
+}
+function dayCount() {
+  dayLeft(); day.n++;
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(DAY_FILE, JSON.stringify(day)); } catch {}
+}
+
 // --- Normalización de números ---------------------------------------------------------
 const { parsePhoneNumberFromString, getCountries, getCountryCallingCode } = require('libphonenumber-js/max');
 const REGION_NAMES = new Intl.DisplayNames(['es'], { type: 'region' });
@@ -215,7 +243,8 @@ class Session {
     if (ENGINE === 'waha') return this.startWaha();
     this.ctx = await chromium.launchPersistentContext(this.dir, {
       headless: HEADLESS, userAgent: UA, viewport: { width: 1100, height: 760 },
-      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+      ignoreDefaultArgs: ['--enable-automation'], // quita la marca "controlado por software de prueba"
     });
     this.page = this.ctx.pages()[0] || await this.ctx.newPage();
     this.page.setDefaultTimeout(8000); // fallar rápido, no esperar 30 s
@@ -344,6 +373,7 @@ class Session {
     for (const n of numbers) {
       if (this.stop || this.closed) break;
       if (acc.used >= acc.limit) { this.error = `Agotaste las ${acc.limit} verificaciones gratis.`; break; }
+      if (dayLeft() === 0) { this.error = `Se alcanzó el tope diario de la línea (${DAILY_CAP}). Seguí mañana.`; break; }
       try {
         let row = await this.check(n);
         if (row.status === 'error') { await this.wait(700); row = await this.check(n); } // un reintento antes de rendirse
@@ -351,7 +381,7 @@ class Session {
         this.rows.push(row);
         if (row.status === 'error') { // respuesta indeterminada: no descuenta cupo y cuenta como fallo
           if (++fallos >= 3) { this.error = 'WhatsApp no devolvió resultados claros (3 seguidos). Probá de nuevo en unos minutos.'; break; }
-        } else { acc.used++; saveAccounts(); fallos = 0; }
+        } else { acc.used++; dayCount(); saveAccounts(); fallos = 0; }
       }
       catch (e) {
         await this.closePanel(); // ante cualquier falla se reabre limpio en el próximo número
@@ -443,7 +473,8 @@ function launch(s, rawBody) {
   if (!nums.length) return { status: 400, code: 'no_valid_numbers', message: 'Ningún número válido: deben tener código de país y un formato correcto (ej. 5491122334455).', normalization: normInfo };
   if (nums.length > MAX_NUMBERS) return { status: 413, code: 'too_many_numbers', message: `Máximo ${MAX_NUMBERS} números por pedido.` };
   const acc = getAccount(s.id);
-  const left = Math.max(0, acc.limit - acc.used);
+  const left = Math.max(0, Math.min(acc.limit - acc.used, dayLeft()));
+  if (dayLeft() === 0) return { status: 429, code: 'daily_cap', message: `Se alcanzó el tope diario de la línea (${DAILY_CAP}). Probá mañana.`, quota: accPub(acc, s.id) };
   if (left === 0) return { status: 402, code: 'quota_exceeded', message: `Usaste tus ${acc.limit} verificaciones gratis.`, quota: accPub(acc, s.id) };
   const truncated = nums.length > left;
   if (truncated) nums = nums.slice(0, left);
@@ -469,6 +500,7 @@ async function api(req, res, url) {
   if (url === '/v1/countries' && req.method === 'GET') return sendJson(res, 200, { countries: countriesList() });
 
   if (url === '/v1/keys' && req.method === 'POST') { // alta de cuenta gratis
+    if (!SIGNUP_OPEN) return apiErr(res, 403, 'signup_closed', 'El alta de cuentas está cerrada en este servicio.');
     if (!ipAllowed(clientIp(req))) return apiErr(res, 429, 'rate_limited', 'Demasiadas cuentas nuevas desde esta red hoy. Probá mañana.');
     const id = crypto.randomBytes(16).toString('hex');
     return sendJson(res, 201, { ...accPub(getAccount(id), id, true), note: 'Guardá la API key: no se puede recuperar.' });
@@ -477,6 +509,7 @@ async function api(req, res, url) {
   const a = authOf(req);
   if (!a) return apiErr(res, 401, 'unauthorized', 'Falta la API key. Usá el encabezado Authorization: Bearer wak_…');
   if (a.viaKey && !accounts[a.id]) return apiErr(res, 401, 'invalid_key', 'API key inválida.');
+  if (!SIGNUP_OPEN && !accounts[a.id]) return apiErr(res, 401, 'signup_closed', 'Acceso restringido: usá la API key registrada.');
   const acc = getAccount(a.id);
   const s = sessions.get(a.id);
   if (s) s.touch();
@@ -512,6 +545,46 @@ async function api(req, res, url) {
     if (req.method === 'DELETE') { if (s) await s.close(true); return sendJson(res, 200, { state: 'none' }); }
   }
 
+  // Consulta individual y síncrona, pensada para llamarla justo antes de cada envío (n8n).
+  // Un número por llamada; responde con yes / no / error (o invalid si el formato no sirve).
+  if (url === '/v1/lookup' && req.method === 'POST') {
+    if (!s) return apiErr(res, 409, 'no_session', 'Primero creá la sesión (POST /v1/session).');
+    if (s.state !== 'connected') return apiErr(res, 409, 'session_not_ready', 'WhatsApp todavía no está conectado.');
+    if (s.syncUntil && Date.now() < s.syncUntil) return apiErr(res, 409, 'session_syncing', 'WhatsApp está sincronizando. Probá en unos segundos.');
+    if (s.running) return apiErr(res, 409, 'job_running', 'Hay una verificación por lote en curso.');
+    let b;
+    try { b = JSON.parse(await body(req)); if (b.phone == null) throw 0; }
+    catch { return apiErr(res, 400, 'invalid_body', 'Enviá JSON con {"phone": "5491122334455"}.'); }
+    const country = String(b.country || (s.me && s.me.country) || '').toUpperCase() || null;
+    const n = b.normalize === false
+      ? (/^\d{8,15}$/.test(String(b.phone).replace(/\D/g, '')) ? { valid: true, phone: String(b.phone).replace(/\D/g, ''), input: String(b.phone), changed: false } : { valid: false, input: String(b.phone), reason: 'debe tener 8 a 15 dígitos' })
+      : normalizePhone(b.phone, country, s.me);
+    if (!n.valid) return sendJson(res, 200, { input: n.input, status: 'invalid', reason: n.reason });
+    if (dayLeft() === 0) return apiErr(res, 429, 'daily_cap', `Se alcanzó el tope diario de la línea (${DAILY_CAP}).`);
+    if (acc.used >= acc.limit) return apiErr(res, 402, 'quota_exceeded', `Usaste tus ${acc.limit} verificaciones.`, { quota: accPub(acc, a.id) });
+    s.lookups = (s.lookups || 0) + 1;
+    s.lookupChain = (s.lookupChain || Promise.resolve()).catch(() => {}).then(async () => {
+      let row = await s.check(n.phone);
+      if (row.status === 'error') { await sleep(500); row = await s.check(n.phone); }
+      return row;
+    });
+    let row;
+    try { row = await s.lookupChain; }
+    catch (e) { row = { phone: n.phone, status: 'error', raw: 'error: ' + String(e.message || e).split('\n')[0] }; await s.closePanel(); }
+    finally {
+      s.lookups--;
+      // el panel queda abierto mientras lleguen consultas seguidas (envíos de n8n); se cierra tras 30 s sin uso
+      clearTimeout(s.panelTimer);
+      if (s.lookups === 0 && ENGINE !== 'waha') s.panelTimer = setTimeout(() => { if (!s.running && !s.lookups) s.closePanel(); }, 30000);
+    }
+    if (row.status !== 'error') { acc.used++; dayCount(); saveAccounts(); }
+    s.touch();
+    return sendJson(res, 200, {
+      phone: n.phone, input: n.input, status: row.status, normalized: !!n.changed, note: n.note || null,
+      ...(row.status === 'error' ? { detail: String(row.raw || '').slice(0, 160) } : {}),
+    });
+  }
+
   if (url === '/v1/checks' && req.method === 'POST') {
     if (!s) return apiErr(res, 409, 'no_session', 'Primero creá la sesión (POST /v1/session) y escaneá el QR.');
     const out = launch(s, await body(req));
@@ -543,6 +616,11 @@ http.createServer(async (req, res) => {
   let sid = authOf(req)?.id;
   const s = sid && sessions.get(sid);
   if (s) s.touch();
+
+  if (!SIGNUP_OPEN && !(sid && accounts[sid]) && (url === '/' || url === '/docs' || url === '/connect')) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Servicio privado: el alta de cuentas está cerrada.');
+  }
 
   if (url === '/' || url === '/docs') {
     if (!sid) {
