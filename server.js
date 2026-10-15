@@ -19,6 +19,15 @@ const KEEP = process.env.KEEP_SESSION === '1';
 const BASE_DIR = process.env.SESSIONS_DIR || path.join(os.tmpdir(), 'wa-sessions');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const SYNC_MS = +process.env.SYNC_WAIT_MS || 45000;        // espera tras vincular, mientras WhatsApp sincroniza
+// ENGINE=waha: verifica con la API de un WAHA ya existente (sin Chromium). Usa UNA línea compartida.
+const ENGINE = (process.env.ENGINE || 'chromium').toLowerCase();
+const WAHA_URL = (process.env.WAHA_URL || '').replace(/\/+$/, '');
+const WAHA_API_KEY = process.env.WAHA_API_KEY || '';
+const WAHA_SESSION = process.env.WAHA_SESSION || 'default';
+const WAHA_GAP_MS = +process.env.WAHA_GAP_MS || 700;       // separación mínima entre consultas a la línea
+const wahaHeaders = () => (WAHA_API_KEY ? { 'X-Api-Key': WAHA_API_KEY } : {});
+let wahaTail = Promise.resolve();                           // una sola consulta a la vez sobre la línea
+const wahaSerial = fn => { const p = wahaTail.then(fn, fn); wahaTail = p.catch(() => {}); return p; };
 const DELAY_TECLA = +process.env.TYPE_DELAY_MS || 70;    // ms entre dígitos
 const ESPERA_RESULTADO = +process.env.WAIT_MS || 500;      // espera a que WhatsApp muestre su respuesta
 const PAUSE_MIN = +process.env.PAUSE_MIN_MS || 0;          // pausa extra entre números (anti-baneo)
@@ -165,7 +174,45 @@ class Session {
   push() { const m = `data: ${JSON.stringify(this.pub())}\n\n`; this.clients.forEach(c => c.write(m)); }
   nuevoChat() { return this.page.getByRole('button', { name: /new chat|nuevo chat/i }).first(); }
 
+  // Motor WAHA: no hay navegador ni QR por cliente; se usa la sesión WORKING del WAHA configurado.
+  async startWaha() {
+    this.state = 'loading'; this.push();
+    try {
+      const r = await fetch(`${WAHA_URL}/api/sessions/${encodeURIComponent(WAHA_SESSION)}`, { headers: wahaHeaders(), signal: AbortSignal.timeout(8000) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.status !== 'WORKING') {
+        this.state = 'unavailable'; this.error = `La línea de WAHA no está lista (${j.status || r.status}).`; this.push(); return;
+      }
+      const d = /(\d{8,15})/.exec((j.me && j.me.id) || '');
+      if (d) this.me = analyzeOwn(d[1]);
+      this.state = 'connected'; this.push();
+    } catch (e) {
+      this.state = 'unavailable'; this.error = 'No pude conectar con WAHA: ' + (e.message || e); this.push();
+    }
+  }
+
+  async checkWaha(num) {
+    this.halt();
+    return wahaSerial(async () => {
+      const t0 = Date.now();
+      try {
+        const u = `${WAHA_URL}/api/contacts/check-exists?phone=${encodeURIComponent(num)}&session=${encodeURIComponent(WAHA_SESSION)}`;
+        const r = await fetch(u, { headers: wahaHeaders(), signal: AbortSignal.timeout(15000) });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || typeof j.numberExists !== 'boolean') {
+          return { phone: num, status: 'error', raw: `[waha ${r.status}] ${JSON.stringify(j).slice(0, 120)}` };
+        }
+        return { phone: num, status: j.numberExists ? 'yes' : 'no', raw: `[waha ${Date.now() - t0}ms] numberExists=${j.numberExists}` };
+      } catch (e) {
+        return { phone: num, status: 'error', raw: 'error: ' + (e.message || e) };
+      } finally {
+        await sleep(WAHA_GAP_MS); // espaciado entre consultas de la línea
+      }
+    });
+  }
+
   async start() {
+    if (ENGINE === 'waha') return this.startWaha();
     this.ctx = await chromium.launchPersistentContext(this.dir, {
       headless: HEADLESS, userAgent: UA, viewport: { width: 1100, height: 760 },
       args: ['--no-sandbox', '--disable-dev-shm-usage'],
@@ -248,6 +295,7 @@ class Session {
 
   // Pega el número de una sola vez (una búsqueda en vez de una por dígito) y lee el panel apenas se estabiliza.
   async check(num) {
+    if (ENGINE === 'waha') return this.checkWaha(num);
     const { page } = this;
     this.halt();
     await this.openPanel();
