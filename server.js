@@ -617,6 +617,15 @@ http.createServer(async (req, res) => {
   const s = sid && sessions.get(sid);
   if (s) s.touch();
 
+  // Acceso privado a la web con la API key: pone la cookie de tu cuenta (para escanear el QR en el servidor)
+  if (url === '/login') {
+    const m = /^wak_([a-f0-9]{32})$/.exec(new URL(req.url, 'http://x').searchParams.get('key') || '');
+    if (!m || !accounts[m[1]]) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('Clave inválida.'); }
+    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    res.writeHead(302, { Location: '/', 'Set-Cookie': `sid=${m[1]}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}`, 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+
   if (!SIGNUP_OPEN && !(sid && accounts[sid]) && (url === '/' || url === '/docs' || url === '/connect')) {
     res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('Servicio privado: el alta de cuentas está cerrada.');
