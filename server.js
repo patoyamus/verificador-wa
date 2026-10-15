@@ -265,7 +265,33 @@ class Session {
         } else {
           const canvas = this.page.locator('canvas').first();
           if (await canvas.isVisible()) {
-            this.qr = (await canvas.screenshot()).toString('base64'); this.state = 'qr';
+            if (this.state !== 'qr') this.qrSince = Date.now();
+            // Pasados unos minutos WhatsApp Web deja de renovar el QR y muestra "Haz clic para recargar":
+            // el lienzo sigue ahí pero ya no sirve. Se pulsa el botón o, si el QR es viejo, se recarga la página.
+            const recargar = this.page.getByRole('button', { name: /reload|recargar|volver a cargar|actualizar|reintentar|try again/i }).first();
+            if (await recargar.isVisible().catch(() => false)) {
+              await recargar.click({ timeout: 2000 }).catch(() => {});
+              this.qrSince = Date.now();
+              await sleep(1500);
+            } else if (Date.now() - (this.qrSince || Date.now()) > 5 * 60 * 1000) {
+              await this.page.reload().catch(() => {});
+              this.qrSince = Date.now();
+              await sleep(2500);
+            }
+            // Imagen nítida: se amplía el lienzo x4 sin suavizar y se agrega margen blanco (los lectores lo necesitan).
+            const url = await this.page.evaluate(() => {
+              const c = document.querySelector('canvas');
+              if (!c || !c.width) return null;
+              const sc = 4, m = 48, o = document.createElement('canvas');
+              o.width = c.width * sc + m * 2; o.height = c.height * sc + m * 2;
+              const x = o.getContext('2d');
+              x.fillStyle = '#fff'; x.fillRect(0, 0, o.width, o.height);
+              x.imageSmoothingEnabled = false;
+              x.drawImage(c, m, m, c.width * sc, c.height * sc);
+              return o.toDataURL('image/png');
+            }).catch(() => null);
+            this.qr = url ? url.replace(/^data:image\/png;base64,/, '') : (await canvas.screenshot()).toString('base64');
+            this.state = 'qr';
           } else if (this.state !== 'connected') this.state = 'loading';
           this.push();
         }
@@ -535,6 +561,11 @@ async function api(req, res, url) {
     if (req.method === 'POST') {
       const ns = openSession(a.id);
       if (!ns) return apiErr(res, 503, 'server_busy', 'El servidor está ocupado. Probá en unos minutos.');
+      // QR viejo (WhatsApp lo deja de renovar): se recarga para tener uno fresco antes de mostrarlo
+      if (ns.state === 'qr' && ns.page && Date.now() - (ns.qrSince || 0) > 25000) {
+        await ns.page.reload().catch(() => {});
+        ns.qrSince = Date.now(); ns.state = 'loading'; ns.qr = null;
+      }
       return sendJson(res, 202, { state: ns.state });
     }
     if (req.method === 'GET') {
