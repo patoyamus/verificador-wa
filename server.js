@@ -540,7 +540,10 @@ async function api(req, res, url) {
   let s = sessions.get(a.id);
   if (s) s.touch();
 
-  if (url === '/v1/account' && req.method === 'GET') return sendJson(res, 200, accPub(acc, a.id, !a.viaKey));
+  if (url === '/v1/account' && req.method === 'GET') {
+    const left = dayLeft();
+    return sendJson(res, 200, { ...accPub(acc, a.id, !a.viaKey), daily_cap: DAILY_CAP || null, daily_used: day.date === new Date().toLocaleDateString('en-CA') ? day.n : 0, daily_left: Number.isFinite(left) ? left : null });
+  }
 
   // Vista previa de la normalización: no gasta cupo ni necesita sesión conectada
   if (url === '/v1/normalize' && req.method === 'POST') {
@@ -645,8 +648,93 @@ async function api(req, res, url) {
   return apiErr(res, 404, 'not_found', 'Ruta no encontrada.');
 }
 
+// --- Conector MCP (Streamable HTTP, sin estado) --------------------------------------------
+// Expone la API como herramientas para Claude. Usa la misma API key (Authorization: Bearer wak_…).
+const MCP_TOOLS = [
+  { name: 'verificar_numero', description: 'Verifica si UN número tiene WhatsApp (sin enviar mensajes). Acepta cualquier formato argentino (011 15…, 54 9…, solo 8 dígitos) y lo normaliza. Devuelve yes / no / invalid / error.',
+    inputSchema: { type: 'object', properties: { phone: { type: 'string', description: 'Teléfono en cualquier formato' }, country: { type: 'string', description: 'Código ISO del país (ej. AR). Por defecto el del número vinculado.' } }, required: ['phone'] } },
+  { name: 'verificar_lista', description: 'Verifica una lista de números (hasta 200). Si tarda más de ~55 s devuelve un id para consultar con resultado_lista.',
+    inputSchema: { type: 'object', properties: { numbers: { type: 'array', items: { type: 'string' }, description: 'Teléfonos en cualquier formato' }, country: { type: 'string' } }, required: ['numbers'] } },
+  { name: 'resultado_lista', description: 'Consulta el resultado de una verificación por lote ya iniciada (id devuelto por verificar_lista).',
+    inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
+  { name: 'estado_linea', description: 'Estado de la línea de WhatsApp del verificador (conectada, número, consultas usadas hoy y tope diario).',
+    inputSchema: { type: 'object', properties: {} } },
+];
+
+async function mcpCall(name, args, authHeader) {
+  const base = `http://127.0.0.1:${PORT}`;
+  const H = { Authorization: authHeader, 'Content-Type': 'application/json' };
+  const call = async (p, opt = {}) => {
+    const r = await fetch(base + p, { ...opt, headers: H, signal: AbortSignal.timeout(opt.timeout || 90000) });
+    const t = await r.text(); let b; try { b = JSON.parse(t); } catch { b = { raw: t }; }
+    return { status: r.status, body: b };
+  };
+  if (name === 'verificar_numero') {
+    const r = await call('/v1/lookup', { method: 'POST', body: JSON.stringify({ phone: args.phone, ...(args.country ? { country: args.country } : {}) }) });
+    return r.body;
+  }
+  if (name === 'verificar_lista') {
+    if (!Array.isArray(args.numbers) || !args.numbers.length) return { error: 'Falta "numbers" (lista de teléfonos).' };
+    if ((await call('/v1/session')).body.state === 'none') await call('/v1/session', { method: 'POST' });
+    const r = await call('/v1/checks', { method: 'POST', body: JSON.stringify({ numbers: args.numbers, ...(args.country ? { country: args.country } : {}) }) });
+    if (r.status !== 202) return r.body;
+    const id = r.body.id;
+    const f = await call(`/v1/checks/${id}?wait=55`, { timeout: 70000 });
+    return { ...f.body, normalization: r.body.normalization };
+  }
+  if (name === 'resultado_lista') {
+    const f = await call(`/v1/checks/${encodeURIComponent(args.id)}?wait=55`, { timeout: 70000 });
+    return f.body;
+  }
+  if (name === 'estado_linea') {
+    await call('/v1/session', { method: 'POST' });
+    for (let i = 0; i < 20; i++) { const s = (await call('/v1/session')).body; if (['connected', 'qr', 'unavailable'].includes(s.state)) break; await sleep(1500); }
+    const s = (await call('/v1/session')).body;
+    const acc = (await call('/v1/account')).body;
+    return { estado: s.state, linea: s.me ? s.me.international : null, consultas_hoy: acc.daily_used, tope_diario: acc.daily_cap, consultas_restantes_hoy: acc.daily_left, requiere_qr: s.state === 'qr' };
+  }
+  return { error: 'Herramienta desconocida: ' + name };
+}
+
+async function mcpHandle(req, res) {
+  const rpc = (id, result, error) => ({ jsonrpc: '2.0', id, ...(error ? { error } : { result }) });
+  const a = authOf(req);
+  if (!a || !a.viaKey || !accounts[a.id]) {
+    res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer' });
+    return res.end(JSON.stringify(rpc(null, null, { code: -32001, message: 'API key inválida o ausente (Authorization: Bearer wak_…)' })));
+  }
+  if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); return res.end(); }
+  let msg;
+  try { msg = JSON.parse(await body(req)); } catch { return sendJson(res, 400, rpc(null, null, { code: -32700, message: 'JSON inválido' })); }
+  const authHeader = 'Bearer wak_' + a.id;
+  const run = async m => {
+    if (m.id === undefined || m.id === null) return null; // notificación
+    switch (m.method) {
+      case 'initialize': return rpc(m.id, { protocolVersion: (m.params && m.params.protocolVersion) || '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'verificador-whatsapp', version: '1.0.0' } });
+      case 'ping': return rpc(m.id, {});
+      case 'tools/list': return rpc(m.id, { tools: MCP_TOOLS });
+      case 'tools/call': {
+        const p = m.params || {};
+        if (!MCP_TOOLS.some(t => t.name === p.name)) return rpc(m.id, null, { code: -32602, message: 'Herramienta desconocida: ' + p.name });
+        try {
+          const out = await mcpCall(p.name, p.arguments || {}, authHeader);
+          return rpc(m.id, { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }], isError: !!(out && out.error) });
+        } catch (e) {
+          return rpc(m.id, { content: [{ type: 'text', text: 'Error: ' + String(e.message || e) }], isError: true });
+        }
+      }
+      default: return rpc(m.id, null, { code: -32601, message: 'Método no soportado: ' + m.method });
+    }
+  };
+  const list = Array.isArray(msg) ? msg : [msg];
+  const outs = (await Promise.all(list.map(run))).filter(Boolean);
+  if (!outs.length) { res.writeHead(202); return res.end(); }
+  return sendJson(res, 200, Array.isArray(msg) ? outs : outs[0]);
+}
+
 http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
+  if (url === '/mcp') return mcpHandle(req, res).catch(e => { try { sendJson(res, 500, { jsonrpc: '2.0', id: null, error: { code: -32603, message: String(e.message || e) } }); } catch {} });
   if (url.startsWith('/v1/')) return api(req, res, url).catch(e => apiErr(res, 500, 'internal', String(e.message || e)));
 
   let sid = authOf(req)?.id;
