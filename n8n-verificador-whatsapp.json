@@ -1,0 +1,159 @@
+{
+  "name": "Verificador WhatsApp - prueba de API",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Probar",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "c1", "name": "base_url", "value": "https://honor-obligation-cookies-auction.trycloudflare.com", "type": "string" },
+            { "id": "c2", "name": "api_key", "value": "wak_PEGA_ACA_TU_API_KEY", "type": "string" },
+            { "id": "c3", "name": "numbers", "value": "5492994713247, 2994713247, 011 15 471-3247, 1100000001, 5493858481092", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').item.json.base_url }}/v1/session",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "Authorization", "value": "=Bearer {{ $('Config').item.json.api_key }}" } ] },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "1 Estado de la sesion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "conditions": [
+            {
+              "id": "k1",
+              "leftValue": "={{ $json.state }}",
+              "rightValue": "connected",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Conectado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').item.json.base_url }}/v1/checks",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "Authorization", "value": "=Bearer {{ $('Config').item.json.api_key }}" } ] },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ numbers: $('Config').item.json.numbers.split(',').map(s => s.trim()).filter(Boolean) }) }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000005",
+      "name": "2 Crear verificacion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, -100]
+    },
+    {
+      "parameters": { "amount": 3, "unit": "seconds" },
+      "id": "a1000000-0000-4000-8000-000000000006",
+      "name": "Esperar",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1100, -100],
+      "webhookId": "a1000000-0000-4000-8000-0000000000aa"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').item.json.base_url }}/v1/checks/{{ $('2 Crear verificacion').item.json.id }}",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "Authorization", "value": "=Bearer {{ $('Config').item.json.api_key }}" } ] },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000007",
+      "name": "3 Leer resultado",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1320, -100]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "conditions": [
+            {
+              "id": "k2",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "running",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000008",
+      "name": "Sigue corriendo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1540, -100]
+    },
+    {
+      "parameters": { "fieldToSplitOut": "results", "options": { "includeBinary": false } },
+      "id": "a1000000-0000-4000-8000-000000000009",
+      "name": "Una fila por numero",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [1760, 0]
+    },
+    {
+      "parameters": {
+        "content": "## Sesión no conectada\nAbrí la web (http://localhost:3000), apretá Comenzar y escaneá el QR.\nLuego volvé a ejecutar este flujo.\n\nRespuesta de `GET /v1/session`: `state` = none | starting | loading | qr | connected.",
+        "height": 180,
+        "width": 320
+      },
+      "id": "a1000000-0000-4000-8000-000000000010",
+      "name": "Nota",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, 120]
+    }
+  ],
+  "connections": {
+    "Probar": { "main": [ [ { "node": "Config", "type": "main", "index": 0 } ] ] },
+    "Config": { "main": [ [ { "node": "1 Estado de la sesion", "type": "main", "index": 0 } ] ] },
+    "1 Estado de la sesion": { "main": [ [ { "node": "Conectado?", "type": "main", "index": 0 } ] ] },
+    "Conectado?": { "main": [ [ { "node": "2 Crear verificacion", "type": "main", "index": 0 } ], [] ] },
+    "2 Crear verificacion": { "main": [ [ { "node": "Esperar", "type": "main", "index": 0 } ] ] },
+    "Esperar": { "main": [ [ { "node": "3 Leer resultado", "type": "main", "index": 0 } ] ] },
+    "3 Leer resultado": { "main": [ [ { "node": "Sigue corriendo?", "type": "main", "index": 0 } ] ] },
+    "Sigue corriendo?": { "main": [ [ { "node": "Esperar", "type": "main", "index": 0 } ], [ { "node": "Una fila por numero", "type": "main", "index": 0 } ] ] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

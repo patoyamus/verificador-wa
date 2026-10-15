@@ -458,7 +458,8 @@ async function api(req, res, url) {
     }
     if (req.method === 'GET') {
       if (!s) return sendJson(res, 200, { state: 'none', qr: null });
-      return sendJson(res, 200, { state: s.state, qr: s.qr, running: s.running });
+      const p = s.pub();
+      return sendJson(res, 200, { state: s.state, qr: s.qr, running: s.running, me: p.me, sync_seconds: p.syncSeconds });
     }
     if (req.method === 'DELETE') { if (s) await s.close(true); return sendJson(res, 200, { state: 'none' }); }
   }
@@ -474,6 +475,9 @@ async function api(req, res, url) {
   if (m && req.method === 'GET') {
     const job = s && s.jobs.get(m[1]);
     if (!job) return apiErr(res, 404, 'job_not_found', 'No existe ese pedido (o la sesión ya se cerró).');
+    // ?wait=N (hasta 60 s): mantiene la conexión hasta que el pedido termine, así no hace falta consultar en bucle
+    const waitMs = Math.min(60, Math.max(0, +new URL(req.url, 'http://x').searchParams.get('wait') || 0)) * 1000;
+    for (let t = 0; job.status === 'running' && t < waitMs && !s.closed; t += 300) await sleep(300);
     if (m[2]) {
       res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${job.id}.csv"` });
       return res.end('phone,status,input\n' + job.rows.map(r => `${r.phone},${r.status},"${String(r.input ?? r.phone).replace(/"/g, '""')}"`).join('\n'));
