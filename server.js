@@ -71,26 +71,31 @@ const NEG = /not on whatsapp|isn.t on whatsapp|no est[aá] en whatsapp|no result
 // ADMIN_KEY (wak_ + 32 hex) registra tu cuenta al arrancar, con cupo prácticamente ilimitado.
 const SIGNUP_OPEN = process.env.SIGNUP !== '0';
 const ADMIN_LIMIT = +process.env.ADMIN_LIMIT || 1000000000;
-{
-  const m = /^wak_([a-f0-9]{32})$/.exec(process.env.ADMIN_KEY || '');
-  if (m) {
-    if (!accounts[m[1]]) accounts[m[1]] = { created: new Date().toISOString(), plan: 'internal', limit: ADMIN_LIMIT, used: 0 };
-    else accounts[m[1]].limit = Math.max(accounts[m[1]].limit, ADMIN_LIMIT);
-    saveAccounts();
-  }
+// ADMIN_KEY_2 (opcional) registra una segunda línea: /v1/lookup con cualquiera de las dos claves
+// reparte las consultas entre las líneas conectadas (la que lleva menos consultas hoy).
+const POOL = [];
+for (const k of [process.env.ADMIN_KEY, process.env.ADMIN_KEY_2]) {
+  const m = /^wak_([a-f0-9]{32})$/.exec(k || '');
+  if (!m) continue;
+  POOL.push(m[1]);
+  if (!accounts[m[1]]) accounts[m[1]] = { created: new Date().toISOString(), plan: 'internal', limit: ADMIN_LIMIT, used: 0 };
+  else accounts[m[1]].limit = Math.max(accounts[m[1]].limit, ADMIN_LIMIT);
+  saveAccounts();
 }
-// Tope diario de consultas de la línea (0 = sin tope). Se reinicia a medianoche (hora del servidor).
+// Tope diario de consultas POR LÍNEA (0 = sin tope). Se reinicia a medianoche (hora del servidor).
 const DAILY_CAP = +process.env.DAILY_CAP || 0;
 const DAY_FILE = path.join(DATA_DIR, 'daycount.json');
-let day = { date: '', n: 0 };
+let day = { date: '', n: 0, by: {} };
 try { day = JSON.parse(fs.readFileSync(DAY_FILE, 'utf8')); } catch {}
-function dayLeft() {
+function dayRoll() {
   const today = new Date().toLocaleDateString('en-CA');
-  if (day.date !== today) day = { date: today, n: 0 };
-  return DAILY_CAP > 0 ? Math.max(0, DAILY_CAP - day.n) : Infinity;
+  if (day.date !== today) day = { date: today, n: 0, by: {} };
+  if (!day.by) day.by = {};
 }
-function dayCount() {
-  dayLeft(); day.n++;
+function dayUsed(id) { dayRoll(); return day.by[id] || 0; }
+function dayLeft(id) { return DAILY_CAP > 0 ? Math.max(0, DAILY_CAP - dayUsed(id)) : Infinity; }
+function dayCount(id) {
+  dayRoll(); day.n++; day.by[id] = (day.by[id] || 0) + 1;
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(DAY_FILE, JSON.stringify(day)); } catch {}
 }
 
@@ -399,7 +404,7 @@ class Session {
     for (const n of numbers) {
       if (this.stop || this.closed) break;
       if (acc.used >= acc.limit) { this.error = `Agotaste las ${acc.limit} verificaciones gratis.`; break; }
-      if (dayLeft() === 0) { this.error = `Se alcanzó el tope diario de la línea (${DAILY_CAP}). Seguí mañana.`; break; }
+      if (dayLeft(this.id) === 0) { this.error = `Se alcanzó el tope diario de la línea (${DAILY_CAP}). Seguí mañana.`; break; }
       try {
         let row = await this.check(n);
         if (row.status === 'error') { await this.wait(700); row = await this.check(n); } // un reintento antes de rendirse
@@ -407,7 +412,7 @@ class Session {
         this.rows.push(row);
         if (row.status === 'error') { // respuesta indeterminada: no descuenta cupo y cuenta como fallo
           if (++fallos >= 3) { this.error = 'WhatsApp no devolvió resultados claros (3 seguidos). Probá de nuevo en unos minutos.'; break; }
-        } else { acc.used++; dayCount(); saveAccounts(); fallos = 0; }
+        } else { acc.used++; dayCount(this.id); saveAccounts(); fallos = 0; }
       }
       catch (e) {
         await this.closePanel(); // ante cualquier falla se reabre limpio en el próximo número
@@ -499,8 +504,8 @@ function launch(s, rawBody) {
   if (!nums.length) return { status: 400, code: 'no_valid_numbers', message: 'Ningún número válido: deben tener código de país y un formato correcto (ej. 5491122334455).', normalization: normInfo };
   if (nums.length > MAX_NUMBERS) return { status: 413, code: 'too_many_numbers', message: `Máximo ${MAX_NUMBERS} números por pedido.` };
   const acc = getAccount(s.id);
-  const left = Math.max(0, Math.min(acc.limit - acc.used, dayLeft()));
-  if (dayLeft() === 0) return { status: 429, code: 'daily_cap', message: `Se alcanzó el tope diario de la línea (${DAILY_CAP}). Probá mañana.`, quota: accPub(acc, s.id) };
+  const left = Math.max(0, Math.min(acc.limit - acc.used, dayLeft(s.id)));
+  if (dayLeft(s.id) === 0) return { status: 429, code: 'daily_cap', message: `Se alcanzó el tope diario de la línea (${DAILY_CAP}). Probá mañana.`, quota: accPub(acc, s.id) };
   if (left === 0) return { status: 402, code: 'quota_exceeded', message: `Usaste tus ${acc.limit} verificaciones gratis.`, quota: accPub(acc, s.id) };
   const truncated = nums.length > left;
   if (truncated) nums = nums.slice(0, left);
@@ -541,8 +546,21 @@ async function api(req, res, url) {
   if (s) s.touch();
 
   if (url === '/v1/account' && req.method === 'GET') {
-    const left = dayLeft();
-    return sendJson(res, 200, { ...accPub(acc, a.id, !a.viaKey), daily_cap: DAILY_CAP || null, daily_used: day.date === new Date().toLocaleDateString('en-CA') ? day.n : 0, daily_left: Number.isFinite(left) ? left : null });
+    const left = dayLeft(a.id);
+    return sendJson(res, 200, { ...accPub(acc, a.id, !a.viaKey), daily_cap: DAILY_CAP || null, daily_used: dayUsed(a.id), daily_left: Number.isFinite(left) ? left : null });
+  }
+
+  // Estado de todas las líneas del pool (las dos claves de administración). Abre las sesiones que estén cerradas.
+  if (url === '/v1/lines' && req.method === 'GET') {
+    if (!POOL.includes(a.id)) return apiErr(res, 403, 'forbidden', 'Solo para las claves de administración.');
+    for (const id of POOL) if (!sessions.get(id)) openSession(id);
+    for (let t = 0; t < 30000 && POOL.some(id => { const x = sessions.get(id); return x && !['connected', 'qr', 'unavailable'].includes(x.state); }); t += 1000) await sleep(1000);
+    const lines = POOL.map((id, i) => {
+      const x = sessions.get(id); const p = x && x.pub ? x.pub() : null; const l = dayLeft(id);
+      return { linea: i + 1, estado: x ? x.state : 'none', numero: p && p.me ? p.me.international : null,
+        consultas_hoy: dayUsed(id), tope_diario: DAILY_CAP || null, restantes_hoy: Number.isFinite(l) ? l : null, requiere_qr: !!x && x.state === 'qr' };
+    });
+    return sendJson(res, 200, { lines });
   }
 
   // Vista previa de la normalización: no gasta cupo ni necesita sesión conectada
@@ -582,8 +600,15 @@ async function api(req, res, url) {
   // Consulta individual y síncrona, pensada para llamarla justo antes de cada envío (n8n).
   // Un número por llamada; responde con yes / no / error (o invalid si el formato no sirve).
   if (url === '/v1/lookup' && req.method === 'POST') {
+    let lid = a.id, lacc = acc;
+    if (POOL.length > 1 && POOL.includes(a.id)) { // reparte entre las líneas conectadas con tope disponible
+      for (const id of POOL) if (!sessions.get(id)) openSession(id);
+      const libres = POOL.filter(id => dayLeft(id) > 0).sort((x, y) => dayUsed(x) - dayUsed(y));
+      const ok = libres.find(id => { const t = sessions.get(id); return t && t.state === 'connected' && !(t.syncUntil && Date.now() < t.syncUntil); });
+      lid = ok || libres[0] || a.id; lacc = getAccount(lid); s = sessions.get(lid);
+    }
     if (!s) { // la sesión se cerró por inactividad: se reabre sola con las credenciales guardadas
-      s = openSession(a.id);
+      s = openSession(lid);
       if (!s) return apiErr(res, 503, 'server_busy', 'El servidor está ocupado.');
     }
     for (let t = 0; t < 45000 && !['connected', 'qr', 'unavailable'].includes(s.state); t += 500) await sleep(500);
@@ -599,8 +624,8 @@ async function api(req, res, url) {
       ? (/^\d{8,15}$/.test(String(b.phone).replace(/\D/g, '')) ? { valid: true, phone: String(b.phone).replace(/\D/g, ''), input: String(b.phone), changed: false } : { valid: false, input: String(b.phone), reason: 'debe tener 8 a 15 dígitos' })
       : normalizePhone(b.phone, country, s.me);
     if (!n.valid) return sendJson(res, 200, { input: n.input, status: 'invalid', reason: n.reason });
-    if (dayLeft() === 0) return apiErr(res, 429, 'daily_cap', `Se alcanzó el tope diario de la línea (${DAILY_CAP}).`);
-    if (acc.used >= acc.limit) return apiErr(res, 402, 'quota_exceeded', `Usaste tus ${acc.limit} verificaciones.`, { quota: accPub(acc, a.id) });
+    if (dayLeft(lid) === 0) return apiErr(res, 429, 'daily_cap', `Se alcanzó el tope diario de las líneas (${DAILY_CAP} por línea).`);
+    if (lacc.used >= lacc.limit) return apiErr(res, 402, 'quota_exceeded', `Usaste tus ${lacc.limit} verificaciones.`, { quota: accPub(lacc, lid) });
     s.lookups = (s.lookups || 0) + 1;
     s.lookupChain = (s.lookupChain || Promise.resolve()).catch(() => {}).then(async () => {
       let row = await s.check(n.phone);
@@ -616,7 +641,7 @@ async function api(req, res, url) {
       clearTimeout(s.panelTimer);
       if (s.lookups === 0 && ENGINE !== 'waha') s.panelTimer = setTimeout(() => { if (!s.running && !s.lookups) s.closePanel(); }, 30000);
     }
-    if (row.status !== 'error') { acc.used++; dayCount(); saveAccounts(); }
+    if (row.status !== 'error') { lacc.used++; dayCount(lid); saveAccounts(); }
     s.touch();
     return sendJson(res, 200, {
       phone: n.phone, input: n.input, status: row.status, normalized: !!n.changed, note: n.note || null,
@@ -691,7 +716,10 @@ async function mcpCall(name, args, authHeader) {
     for (let i = 0; i < 20; i++) { const s = (await call('/v1/session')).body; if (['connected', 'qr', 'unavailable'].includes(s.state)) break; await sleep(1500); }
     const s = (await call('/v1/session')).body;
     const acc = (await call('/v1/account')).body;
-    return { estado: s.state, linea: s.me ? s.me.international : null, consultas_hoy: acc.daily_used, tope_diario: acc.daily_cap, consultas_restantes_hoy: acc.daily_left, requiere_qr: s.state === 'qr' };
+    const out = { estado: s.state, linea: s.me ? s.me.international : null, consultas_hoy: acc.daily_used, tope_diario: acc.daily_cap, consultas_restantes_hoy: acc.daily_left, requiere_qr: s.state === 'qr' };
+    const ls = await call('/v1/lines'); // si hay dos líneas, también se muestran
+    if (ls.body && Array.isArray(ls.body.lines) && ls.body.lines.length > 1) out.lineas = ls.body.lines;
+    return out;
   }
   return { error: 'Herramienta desconocida: ' + name };
 }
