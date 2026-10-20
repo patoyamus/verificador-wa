@@ -184,6 +184,9 @@ function normalizeList(list, country, ref, doNormalize = true) {
 
 const sessions = new Map();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Pausa mínima por línea entre consultas del pool (LINE_GAP_MIN_MS/LINE_GAP_MAX_MS) y espera máxima por consulta.
+const LINE_GAP_MIN = +process.env.LINE_GAP_MIN_MS || 0, LINE_GAP_MAX = +process.env.LINE_GAP_MAX_MS || LINE_GAP_MIN, GAP_WAIT_MAX = 5000;
+const lineNext = {};
 
 class Session {
   constructor(id) {
@@ -603,9 +606,15 @@ async function api(req, res, url) {
     let lid = a.id, lacc = acc;
     if (POOL.length > 1 && POOL.includes(a.id)) { // reparte entre las líneas conectadas con tope disponible
       for (const id of POOL) if (!sessions.get(id)) openSession(id);
-      const libres = POOL.filter(id => dayLeft(id) > 0).sort((x, y) => dayUsed(x) - dayUsed(y));
-      const ok = libres.find(id => { const t = sessions.get(id); return t && t.state === 'connected' && !(t.syncUntil && Date.now() < t.syncUntil); });
-      lid = ok || libres[0] || a.id; lacc = getAccount(lid); s = sessions.get(lid);
+      // rotación: va a la línea conectada que antes puede volver a consultar (la más descansada)
+      const libres = POOL.filter(id => dayLeft(id) > 0);
+      const listas = libres.filter(id => { const t = sessions.get(id); return t && t.state === 'connected' && !(t.syncUntil && Date.now() < t.syncUntil); });
+      const orden = (listas.length ? listas : libres).sort((x, y) => (lineNext[x] || 0) - (lineNext[y] || 0) || dayUsed(x) - dayUsed(y));
+      lid = orden[0] || a.id; lacc = getAccount(lid); s = sessions.get(lid);
+      // pausa mínima por línea entre consultas; si ninguna está lista espera poco y sigue (nunca falla por esto)
+      const espera = Math.max(0, (lineNext[lid] || 0) - Date.now());
+      if (espera > 0) await sleep(Math.min(espera, GAP_WAIT_MAX));
+      lineNext[lid] = Date.now() + LINE_GAP_MIN + Math.random() * Math.max(0, LINE_GAP_MAX - LINE_GAP_MIN);
     }
     if (!s) { // la sesión se cerró por inactividad: se reabre sola con las credenciales guardadas
       s = openSession(lid);
