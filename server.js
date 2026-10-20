@@ -74,7 +74,7 @@ const ADMIN_LIMIT = +process.env.ADMIN_LIMIT || 1000000000;
 // ADMIN_KEY_2 (opcional) registra una segunda línea: /v1/lookup con cualquiera de las dos claves
 // reparte las consultas entre las líneas conectadas (la que lleva menos consultas hoy).
 const POOL = [];
-for (const k of [process.env.ADMIN_KEY, process.env.ADMIN_KEY_2, process.env.ADMIN_KEY_3]) {
+for (const k of [process.env.ADMIN_KEY, ...[2, 3, 4, 5, 6].map(i => process.env['ADMIN_KEY_' + i])]) {
   const m = /^wak_([a-f0-9]{32})$/.exec(k || '');
   if (!m) continue;
   POOL.push(m[1]);
